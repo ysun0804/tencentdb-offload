@@ -68,6 +68,34 @@ def _post_json(
 _ROUGH_CHARS_PER_TOKEN = 3.5  # conservative for mixed CJK/English
 
 
+def _truncate_tool_result(msg: Dict[str, Any], max_chars: int = 500) -> Dict[str, Any]:
+    """Truncate tool_result content in a message to avoid huge HTTP bodies."""
+    content = msg.get("content", "")
+    if isinstance(content, str) and len(content) > max_chars:
+        role = msg.get("role", "")
+        if role in ("tool", "function"):
+            msg = dict(msg)
+            msg["content"] = content[:max_chars] + "\n...[truncated for compact]"
+    elif isinstance(content, list):
+        changed = False
+        new_content = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text", block.get("content", ""))
+                if isinstance(text, str) and len(text) > max_chars:
+                    block = dict(block)
+                    if "text" in block:
+                        block["text"] = text[:max_chars] + "\n...[truncated for compact]"
+                    elif "content" in block:
+                        block["content"] = text[:max_chars] + "\n...[truncated for compact]"
+                    changed = True
+            new_content.append(block)
+        if changed:
+            msg = dict(msg)
+            msg["content"] = new_content
+    return msg
+
+
 def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list."""
     total_chars = 0
@@ -258,11 +286,15 @@ class TencentDBOffloadEngine(ContextEngine):
             session_id,
         )
 
+        # Limit messages sent to Gateway to avoid HTTP body too large (Broken pipe).
+        # Keep system + first N + last M, truncate middle tool results.
+        send_msgs = self._prepare_for_compact(messages)
+
         result = _post_json(
             f"{self._gateway_url}/v2/offload/compact",
             {
                 "session_id": session_id,
-                "messages": messages,
+                "messages": send_msgs,
                 "ratio": self._compact_ratio,
                 "context_window": self.context_length or 200000,
                 "total_tokens": tokens,
@@ -303,6 +335,41 @@ class TencentDBOffloadEngine(ContextEngine):
             return compacted
         logger.warning("[tencentdb-offload] server returned 0 messages, keeping original")
         return messages
+
+    # -- Message preparation for compact API ---------------------------------
+
+    def _prepare_for_compact(
+        self, messages: List[Dict[str, Any]], max_messages: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Truncate oversized message list before sending to compact API.
+
+        The TencentDB Gateway has practical HTTP body limits. When the
+        conversation has hundreds of messages with large tool outputs,
+        sending them all in one POST causes Broken pipe.
+
+        Strategy: keep system + first 3 + last (max_messages - 3) messages,
+        and truncate tool_result content in the middle to 500 chars.
+        """
+        if len(messages) <= max_messages:
+            # Still truncate oversized tool results
+            return [_truncate_tool_result(msg) for msg in messages]
+
+        head = messages[:4]  # system + first 3
+        tail = messages[-(max_messages - 4):]
+
+        result = []
+        for msg in head:
+            result.append(_truncate_tool_result(msg))
+        for msg in tail:
+            result.append(_truncate_tool_result(msg))
+
+        logger.info(
+            "[tencentdb-offload] prepared %d→%d messages for compact "
+            "(truncated middle, limited tool results)",
+            len(messages),
+            len(result),
+        )
+        return result
 
     # -- Fallback compaction ---------------------------------------------
 
