@@ -1,0 +1,139 @@
+"""tencentdb-offload — Hermes plugin registration.
+
+Plugin entry point.  When ``context.engine: tencentdb-offload`` is set in
+config.yaml, Hermes calls ``register(ctx)`` which creates the engine and
+hooks it into the lifecycle.
+"""
+
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def register(ctx):
+    """Plugin entry point — register TencentDB offload as context engine."""
+    from .engine import TencentDBOffloadEngine
+
+    engine = TencentDBOffloadEngine()
+
+    # Register as the context engine
+    if not hasattr(ctx, "register_context_engine") or not callable(ctx.register_context_engine):
+        logger.error(
+            "[tencentdb-offload] this Hermes host does not support "
+            "register_context_engine — plugin disabled"
+        )
+        return
+
+    ctx.register_context_engine(engine)
+
+    # Optional: register after-tool-call hook for background ingest
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        try:
+            register_hook(
+                hook_name="after_tool_call",
+                handler=_make_after_tool_call_handler(engine),
+            )
+            logger.info("[tencentdb-offload] registered after_tool_call hook")
+        except Exception as exc:
+            logger.debug(
+                "[tencentdb-offload] after_tool_call hook registration skipped: %s",
+                exc,
+            )
+
+    # Optional: bind session ID when session starts
+    register_session_hook = getattr(ctx, "on_session_start", None) or getattr(
+        ctx, "register_session_hook", None
+    )
+    if callable(register_session_hook):
+        try:
+            register_session_hook(
+                handler=_make_session_start_handler(engine),
+            )
+            logger.info("[tencentdb-offload] registered session_start hook")
+        except Exception as exc:
+            logger.debug(
+                "[tencentdb-offload] session hook registration skipped: %s", exc
+            )
+
+    # Optional: register /tencentdb-offload slash command
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command):
+        try:
+            register_command(
+                name="tencentdb-offload",
+                handler=_make_status_command_handler(engine),
+                description="Show TencentDB offload context engine status",
+            )
+            logger.info("[tencentdb-offload] registered /tencentdb-offload command")
+        except Exception as exc:
+            logger.debug(
+                "[tencentdb-offload] command registration skipped: %s", exc
+            )
+
+    logger.info(
+        "[tencentdb-offload] plugin registered (gateway=%s)",
+        engine._gateway_url,
+    )
+
+
+def _make_after_tool_call_handler(engine):
+    """Create a hook handler that ingests tool pairs for L1 offload."""
+
+    def _handler(*args, **kwargs):
+        try:
+            # Extract tool name, call id, params, result from hook args
+            tool_name = kwargs.get("tool_name") or (
+                args[0] if args else kwargs.get("name", "")
+            )
+            tool_call_id = kwargs.get("tool_call_id") or kwargs.get("call_id", "")
+            params = kwargs.get("params") or kwargs.get("arguments", {})
+            result = kwargs.get("result") or kwargs.get("output", "")
+            error = kwargs.get("error")
+
+            # Build tool pair payload
+            pair = {
+                "tool_name": str(tool_name)[:200],
+                "tool_call_id": str(tool_call_id)[:200],
+                "params": _truncate(str(params), 4000),
+                "result": _truncate(str(result), 8000),
+            }
+            if error:
+                pair["error"] = _truncate(str(error), 2000)
+
+            engine.ingest_tool_pairs([pair])
+        except Exception as exc:
+            logger.debug("[tencentdb-offload] after_tool_call hook error: %s", exc)
+
+    return _handler
+
+
+def _make_session_start_handler(engine):
+    """Create a handler that binds the session ID on new sessions."""
+
+    def _handler(session_id=None, *args, **kwargs):
+        sid = session_id or kwargs.get("session_id", "")
+        if sid:
+            engine.bind_session(str(sid))
+
+    return _handler
+
+
+def _make_status_command_handler(engine):
+    """Create a slash command handler that prints engine status."""
+
+    def _handler(*args, **kwargs):
+        import json
+        status = engine.get_status()
+        lines = [f"  {k}: {v}" for k, v in status.items()]
+        return "TencentDB Offload Status\n" + "\n".join(lines)
+
+    return _handler
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...[truncated]"
