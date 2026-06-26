@@ -68,14 +68,41 @@ def _post_json(
 _ROUGH_CHARS_PER_TOKEN = 3.5  # conservative for mixed CJK/English
 
 
+def _is_tool_result(msg: Dict[str, Any]) -> bool:
+    """Detect tool-result messages in OpenAI or Anthropic format.
+
+    Mirrors OpenClaw ``context-engine.ts`` ``isToolResult()``:
+      - OpenAI: role in {tool, function, toolResult, tool_result}
+      - Anthropic: user message whose content list contains ``tool_result`` blocks
+    """
+    role = msg.get("role", "")
+    if role in ("tool", "function", "toolResult", "tool_result"):
+        return True
+    content = msg.get("content")
+    if role == "user" and isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        )
+    return False
+
+
 def _truncate_tool_result(msg: Dict[str, Any], max_chars: int = 500) -> Dict[str, Any]:
-    """Truncate tool_result content in a message to avoid huge HTTP bodies."""
+    """Truncate tool_result content in a message to avoid huge HTTP bodies.
+
+    Handles both OpenAI format (role="tool"/"function" with string content) and
+    Anthropic format (user messages with ``tool_result`` content blocks).
+    Mirrors OpenClaw ``context-engine.ts`` ``truncateToolResult()``.
+    """
+    _MARKER = "\n...[truncated for compact]"
     content = msg.get("content", "")
+
+    # OpenAI format: tool/function role with string content
     if isinstance(content, str) and len(content) > max_chars:
-        role = msg.get("role", "")
-        if role in ("tool", "function"):
+        if _is_tool_result(msg):
             msg = dict(msg)
-            msg["content"] = content[:max_chars] + "\n...[truncated for compact]"
+            msg["content"] = content[:max_chars] + _MARKER
+    # List content blocks (OpenAI multi-block, or Anthropic tool_result blocks)
     elif isinstance(content, list):
         changed = False
         new_content = []
@@ -85,9 +112,9 @@ def _truncate_tool_result(msg: Dict[str, Any], max_chars: int = 500) -> Dict[str
                 if isinstance(text, str) and len(text) > max_chars:
                     block = dict(block)
                     if "text" in block:
-                        block["text"] = text[:max_chars] + "\n...[truncated for compact]"
+                        block["text"] = text[:max_chars] + _MARKER
                     elif "content" in block:
-                        block["content"] = text[:max_chars] + "\n...[truncated for compact]"
+                        block["content"] = text[:max_chars] + _MARKER
                     changed = True
             new_content.append(block)
         if changed:
@@ -343,51 +370,59 @@ class TencentDBOffloadEngine(ContextEngine):
     ) -> List[Dict[str, Any]]:
         """Reduce message payload size before sending to compact API.
 
-        Adaptive strategy: estimate total body size, only truncate if needed.
-        Preserves ALL messages when body is small enough for the Gateway.
+        Adaptive strategy aligned with OpenClaw ``context-engine.ts``:
+          Step 1 — keep ALL messages if body <= max_body_mb (no truncation)
+          Step 2 — truncate each tool result to 2000 chars (TOOL_RESULT_TRUNCATE_CHARS)
+          Step 3 — if still too large, truncate tool results to 500 chars
+          Step 4 — last resort: keep head(4) + tail(N) sized by body ratio
+
+        Body size is logged at every step for debugging.
         """
         import json as _json
 
-        # Estimate current body size
-        body_bytes = len(_json.dumps(messages, ensure_ascii=False).encode("utf-8"))
-        body_mb = body_bytes / (1024 * 1024)
+        def _body_mb(msgs: List[Dict[str, Any]]) -> float:
+            return len(_json.dumps(msgs, ensure_ascii=False).encode("utf-8")) / (1024 * 1024)
 
-        if body_mb <= max_body_mb:
-            return messages  # No truncation needed
+        n = len(messages)
 
-        # Step 1: Truncate tool results to 2000 chars
-        result = [_truncate_tool_result(msg, max_chars=2000) for msg in messages]
-        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
-        body_mb = body_bytes / (1024 * 1024)
-
-        if body_mb <= max_body_mb:
-            logger.info(
-                "[tencentdb-offload] truncated tool results: %.1fMB → %.1fMB (all %d msgs preserved)",
-                body_mb, body_mb, len(result),
-            )
-            return result
-
-        # Step 2: More aggressive — truncate tool results to 500 chars
-        result = [_truncate_tool_result(msg, max_chars=500) for msg in messages]
-        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
-        body_mb = body_bytes / (1024 * 1024)
-
-        if body_mb <= max_body_mb:
-            logger.info(
-                "[tencentdb-offload] aggressive truncation: tool results → 500 chars, %.1fMB (all %d msgs)",
-                body_mb, len(result),
-            )
-            return result
-
-        # Step 3: Last resort — drop middle messages (keep head + tail)
-        keep = max(200, int(len(messages) * max_body_mb / body_mb))
-        head = result[:4]
-        tail = result[-(keep - 4):]
-        result = head + tail
-        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        # Step 1: no truncation if body fits the Gateway limit
+        before = _body_mb(messages)
         logger.info(
-            "[tencentdb-offload] extreme: %d→%d messages, %.1fMB (dropped middle)",
-            len(messages), len(result), body_bytes / (1024 * 1024),
+            "[tencentdb-offload] prepare: %d msgs, %.2fMB (limit %.1fMB)",
+            n, before, max_body_mb,
+        )
+        if before <= max_body_mb:
+            return messages
+
+        # Step 2: truncate each tool result to 2000 chars (matches reference)
+        result = [_truncate_tool_result(msg, max_chars=2000) for msg in messages]
+        after = _body_mb(result)
+        logger.info(
+            "[tencentdb-offload] prepare step2 (tool→2000): %.2fMB → %.2fMB, %d msgs preserved",
+            before, after, len(result),
+        )
+        if after <= max_body_mb:
+            return result
+
+        # Step 3: aggressive — truncate tool results to 500 chars
+        result = [_truncate_tool_result(msg, max_chars=500) for msg in messages]
+        after = _body_mb(result)
+        logger.info(
+            "[tencentdb-offload] prepare step3 (tool→500): %.2fMB → %.2fMB, %d msgs preserved",
+            before, after, len(result),
+        )
+        if after <= max_body_mb:
+            return result
+
+        # Step 4: last resort — keep head(4) + tail(N) by body-size ratio
+        keep = min(max(8, int(n * max_body_mb / after)), len(result))
+        head = result[:4]
+        tail = result[-(keep - 4):] if keep > 4 else []
+        result = head + tail
+        after = _body_mb(result)
+        logger.info(
+            "[tencentdb-offload] prepare step4 (head+tail): %d→%d msgs, %.2fMB → %.2fMB (dropped middle)",
+            n, len(result), before, after,
         )
         return result
 
