@@ -339,36 +339,34 @@ class TencentDBOffloadEngine(ContextEngine):
     # -- Message preparation for compact API ---------------------------------
 
     def _prepare_for_compact(
-        self, messages: List[Dict[str, Any]], max_messages: int = 200
+        self, messages: List[Dict[str, Any]], max_chars_per_msg: int = 2000
     ) -> List[Dict[str, Any]]:
-        """Truncate oversized message list before sending to compact API.
+        """Reduce message payload size before sending to compact API.
 
         The TencentDB Gateway has practical HTTP body limits. When the
         conversation has hundreds of messages with large tool outputs,
         sending them all in one POST causes Broken pipe.
 
-        Strategy: keep system + first 3 + last (max_messages - 3) messages,
-        and truncate tool_result content in the middle to 500 chars.
+        Strategy: keep ALL messages (preserve conversation structure),
+        but truncate tool_result content to max_chars_per_msg.
+        This lets the compact API see the full conversation and make
+        intelligent compression decisions, while keeping body size manageable.
         """
-        if len(messages) <= max_messages:
-            # Still truncate oversized tool results
-            return [_truncate_tool_result(msg) for msg in messages]
-
-        head = messages[:4]  # system + first 3
-        tail = messages[-(max_messages - 4):]
-
         result = []
-        for msg in head:
-            result.append(_truncate_tool_result(msg))
-        for msg in tail:
-            result.append(_truncate_tool_result(msg))
+        for msg in messages:
+            result.append(_truncate_tool_result(msg, max_chars=max_chars_per_msg))
 
-        logger.info(
-            "[tencentdb-offload] prepared %d→%d messages for compact "
-            "(truncated middle, limited tool results)",
-            len(messages),
-            len(result),
-        )
+        # If still too many messages, drop middle with a higher cap
+        # (only as last resort — the compact API should handle this)
+        if len(result) > 500:
+            head = result[:4]
+            tail = result[-(500 - 4):]
+            result = head + tail
+            logger.info(
+                "[tencentdb-offload] extreme case: %d→%d messages (dropped middle)",
+                len(messages), len(result),
+            )
+
         return result
 
     # -- Fallback compaction ---------------------------------------------
