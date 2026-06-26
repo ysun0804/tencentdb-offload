@@ -339,34 +339,56 @@ class TencentDBOffloadEngine(ContextEngine):
     # -- Message preparation for compact API ---------------------------------
 
     def _prepare_for_compact(
-        self, messages: List[Dict[str, Any]], max_chars_per_msg: int = 2000
+        self, messages: List[Dict[str, Any]], max_body_mb: float = 4.0
     ) -> List[Dict[str, Any]]:
         """Reduce message payload size before sending to compact API.
 
-        The TencentDB Gateway has practical HTTP body limits. When the
-        conversation has hundreds of messages with large tool outputs,
-        sending them all in one POST causes Broken pipe.
-
-        Strategy: keep ALL messages (preserve conversation structure),
-        but truncate tool_result content to max_chars_per_msg.
-        This lets the compact API see the full conversation and make
-        intelligent compression decisions, while keeping body size manageable.
+        Adaptive strategy: estimate total body size, only truncate if needed.
+        Preserves ALL messages when body is small enough for the Gateway.
         """
-        result = []
-        for msg in messages:
-            result.append(_truncate_tool_result(msg, max_chars=max_chars_per_msg))
+        import json as _json
 
-        # If still too many messages, drop middle with a higher cap
-        # (only as last resort — the compact API should handle this)
-        if len(result) > 500:
-            head = result[:4]
-            tail = result[-(500 - 4):]
-            result = head + tail
+        # Estimate current body size
+        body_bytes = len(_json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+        body_mb = body_bytes / (1024 * 1024)
+
+        if body_mb <= max_body_mb:
+            return messages  # No truncation needed
+
+        # Step 1: Truncate tool results to 2000 chars
+        result = [_truncate_tool_result(msg, max_chars=2000) for msg in messages]
+        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        body_mb = body_bytes / (1024 * 1024)
+
+        if body_mb <= max_body_mb:
             logger.info(
-                "[tencentdb-offload] extreme case: %d→%d messages (dropped middle)",
-                len(messages), len(result),
+                "[tencentdb-offload] truncated tool results: %.1fMB → %.1fMB (all %d msgs preserved)",
+                body_mb, body_mb, len(result),
             )
+            return result
 
+        # Step 2: More aggressive — truncate tool results to 500 chars
+        result = [_truncate_tool_result(msg, max_chars=500) for msg in messages]
+        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        body_mb = body_bytes / (1024 * 1024)
+
+        if body_mb <= max_body_mb:
+            logger.info(
+                "[tencentdb-offload] aggressive truncation: tool results → 500 chars, %.1fMB (all %d msgs)",
+                body_mb, len(result),
+            )
+            return result
+
+        # Step 3: Last resort — drop middle messages (keep head + tail)
+        keep = max(200, int(len(messages) * max_body_mb / body_mb))
+        head = result[:4]
+        tail = result[-(keep - 4):]
+        result = head + tail
+        body_bytes = len(_json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        logger.info(
+            "[tencentdb-offload] extreme: %d→%d messages, %.1fMB (dropped middle)",
+            len(messages), len(result), body_bytes / (1024 * 1024),
+        )
         return result
 
     # -- Fallback compaction ---------------------------------------------
