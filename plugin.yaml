@@ -1,5 +1,5 @@
 name: tencentdb-offload
-version: 0.1.0
+version: 0.2.0
 description: "TencentDB offload as Hermes ContextEngine — multi-layer context compression via offload V2 API (L1 tool-pair summary, L2 Mermaid canvas, L3 compaction). Talk to :8420 HTTP API only; no TencentDB code dependency."
 author: "ClawCompany"
 provides_context_engine: tencentdb-offload

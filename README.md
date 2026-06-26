@@ -9,6 +9,8 @@
 - **L1 卸载**：工具调用/结果对的摘要化（将冗长工具输出替换为精简摘要）
 - **L2 Mermaid 画布**：对话状态的可视化符号图谱
 - **L3 压缩**：同步多级压缩（fast-path → mild → aggressive → emergency）
+- **自适应截断**：compact 前自动评估 HTTP body 大小，逐级截断 tool result（2000→500 字符），仅超限才丢消息
+- **Anthropic 格式支持**：识别 user 消息中的 tool_result content blocks
 - **优雅降级**：Gateway 不可用时自动切换为尾部截断（保持 tool-call/result 完整性）
 - **线程安全**：无锁 HTTP 调用 + 快照式状态修改
 - **零外部依赖**：纯 Python 标准库（urllib, json, threading, logging）
@@ -115,6 +117,19 @@ tencentdb-offload/
 1. **纯 HTTP API 契约** — 不 import 任何 TencentDB 内部代码，服务端升级只要 V2 API 不变就自动兼容
 2. **进程级 health cache** — `_available` 变量缓存健康检查结果，`bind_session()` 重置缓存让新 session 自动恢复
 3. **compress() 无锁 HTTP** — 持锁快照 mutable state，释放锁后做 HTTP 调用，避免 30s compact 阻塞并发写入
+
+## CHANGELOG
+
+### v0.2.0 (2026-06-26)
+- **自适应截断策略**：对齐 OpenClaw `context-engine.ts`，4 级 body-size 自适应（≤4MB 不截断 → 2000 字符 → 500 字符 → head+tail 兜底）
+- **Anthropic 格式支持**：`_is_tool_result()` 检测 user 消息中的 tool_result content blocks
+- **内置摘要器禁用**：配合 `auxiliary.compression.model: ''`，压缩只走 tencentdb-offload
+- **compact body 日志**：每级截断记录 before→after MB 和消息数
+
+### v0.1.0 (2026-06-25)
+- 初始版本：ContextEngine ABC 实现，compress/ingest/health 接口
+- Gateway :8420 HTTP 通信，零外部依赖
+- 尾部截断 fallback（保持 tool pair 完整性）
 
 ## 许可证
 
