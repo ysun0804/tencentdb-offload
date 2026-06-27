@@ -185,7 +185,7 @@ class TencentDBOffloadEngine(ContextEngine):
             os.environ.get("TENCENTDB_OFFLOAD_COMPACT_RATIO", "0.5")
         )
         self._compact_timeout_ms = int(
-            os.environ.get("TENCENTDB_OFFLOAD_TIMEOUT_MS", "30000")
+            os.environ.get("TENCENTDB_OFFLOAD_TIMEOUT_MS", "90000")
         )
         self._ingest_timeout_ms = int(
             os.environ.get("TENCENTDB_OFFLOAD_INGEST_TIMEOUT_MS", "5000")
@@ -366,7 +366,7 @@ class TencentDBOffloadEngine(ContextEngine):
     # -- Message preparation for compact API ---------------------------------
 
     def _prepare_for_compact(
-        self, messages: List[Dict[str, Any]], max_body_mb: float = 4.0
+        self, messages: List[Dict[str, Any]], max_body_mb: float = 0.5
     ) -> List[Dict[str, Any]]:
         """Reduce message payload size before sending to compact API.
 
