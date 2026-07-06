@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 def register(ctx):
     """Plugin entry point — register TencentDB offload as context engine."""
+    logger.warning('[tencentdb-offload] register() CALLED')
     from .engine import TencentDBOffloadEngine
 
     engine = TencentDBOffloadEngine()
@@ -40,13 +41,29 @@ def register(ctx):
         try:
             register_hook(
                 hook_name="post_tool_call",
-                handler=_make_post_tool_call_handler(engine),
+                callback=_make_post_tool_call_handler(engine),
             )
             logger.info("[tencentdb-offload] registered post_tool_call hook")
         except Exception as exc:
             logger.warning(
                 "[tencentdb-offload] post_tool_call hook registration failed: %s "
                 "(L1 entries will not populate — compression will degrade)",
+                exc,
+            )
+
+        # Register pre_llm_call hook for incremental L3 compression +
+        # MMD injection + heartbeat filtering.
+        # Equivalent to OpenClaw's before_prompt_build / llm_input_l3.
+        try:
+            register_hook(
+                hook_name="pre_llm_call",
+                callback=_make_pre_llm_call_handler(engine),
+            )
+            logger.info("[tencentdb-offload] registered pre_llm_call hook")
+        except Exception as exc:
+            logger.warning(
+                "[tencentdb-offload] pre_llm_call hook registration failed: %s "
+                "(MMD injection and incremental compression will be unavailable)",
                 exc,
             )
 
@@ -57,7 +74,7 @@ def register(ctx):
     if callable(register_session_hook):
         try:
             register_session_hook(
-                handler=_make_session_start_handler(engine),
+                callback=_make_session_start_handler(engine),
             )
             logger.info("[tencentdb-offload] registered session_start hook")
         except Exception as exc:
@@ -71,7 +88,7 @@ def register(ctx):
         try:
             register_command(
                 name="tencentdb-offload",
-                handler=_make_status_command_handler(engine),
+                callback=_make_status_command_handler(engine),
                 description="Show TencentDB offload context engine status",
             )
             logger.info("[tencentdb-offload] registered /tencentdb-offload command")
@@ -95,6 +112,7 @@ def _make_post_tool_call_handler(engine):
     """
 
     def _handler(*args, **kwargs):
+        logger.info('[tencentdb-offload] post_tool_call FIRED: tool=%s', kwargs.get("tool_name", "?"))
         try:
             tool_name = kwargs.get("tool_name") or ""
             tool_call_id = (
@@ -154,6 +172,34 @@ def _coerce_params(params: Any) -> Any:
     if isinstance(params, (dict, list)):
         return params
     return _truncate(str(params), 4000)
+
+
+def _make_pre_llm_call_handler(engine):
+    """Create a pre_llm_call hook handler for incremental L3 + MMD injection.
+
+    Hermes emits ``pre_llm_call`` before each LLM API call.  The handler
+    receives kwargs including ``messages`` (the message list to be sent).
+    We modify messages in-place for:
+      - Heartbeat filtering (remove internal probe tool_use/result pairs)
+      - MMD canvas injection (active + history task context)
+      - Incremental L3 compression (when approaching threshold)
+
+    Equivalent to OpenClaw's ``before_prompt_build`` + ``llm_input_l3``.
+    """
+
+    def _handler(*args, **kwargs):
+        messages = kwargs.get("messages") or (args[0] if args else None)
+        if not isinstance(messages, list) or not messages:
+            return
+
+        try:
+            engine.pre_llm_call(messages, **kwargs)
+        except Exception as exc:
+            logger.debug(
+                "[tencentdb-offload] pre_llm_call hook error: %s", exc
+            )
+
+    return _handler
 
 
 def _make_session_start_handler(engine):

@@ -24,9 +24,11 @@ Configuration via environment variables (or ``plugin.yaml``):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -244,6 +246,7 @@ class TencentDBOffloadEngine(ContextEngine):
         self._session_id: str = ""
         self._lock = threading.Lock()
         self._available: Optional[bool] = None  # lazy health check
+        self._session_registry: Optional[SessionRegistry] = None  # Feature 5
 
         logger.info(
             "[tencentdb-offload] init: gateway=%s, instance=%s, ratio=%.2f",
@@ -570,6 +573,7 @@ class TencentDBOffloadEngine(ContextEngine):
 
     def get_status(self) -> Dict[str, Any]:
         """Return engine status snapshot for diagnostics."""
+        registry = self._session_registry
         return {
             "engine": "tencentdb-offload",
             "gateway_url": self._gateway_url,
@@ -582,6 +586,9 @@ class TencentDBOffloadEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "context_length": self.context_length,
             "compact_ratio": self._compact_ratio,
+            # Feature 5: session registry
+            "cached_sessions": registry.size if registry else 0,
+            "features": ["pre_llm_call", "mmd_injection", "reclaimer", "session_registry"],
         }
 
     # -- Background ingestion (called by hook, not part of abstract) ------
@@ -866,3 +873,696 @@ class TencentDBOffloadEngine(ContextEngine):
             context_length,
             self.threshold_tokens,
         )
+
+    # ======================================================================
+    # Feature 1: pre_llm_call — L3 incremental compression + fastpath
+    # ======================================================================
+
+    def pre_llm_call(self, messages: List[Dict[str, Any]], **kwargs) -> Optional[Dict[str, Any]]:
+        """Called before each LLM call (via pre_llm_call hook).
+
+        Mirrors OpenClaw's ``before_prompt_build`` / ``llm_input_l3``:
+          1. Filter heartbeat messages
+          2. Request MMD injection data from Gateway
+          3. If approaching threshold, trigger incremental compression
+
+        Returns None (no message injection) — this hook modifies messages
+        in-place via the Gateway compact API rather than injecting context.
+        """
+        if not messages:
+            return None
+
+        session_id = self._session_id or kwargs.get("session_id", "hermes-default")
+        if session_id and session_id != self._session_id:
+            self.bind_session(session_id)
+
+        # Step 1: Filter heartbeat messages (best-effort, in-place)
+        self._filter_heartbeat_messages(messages)
+
+        # Step 2: Request MMD injection from Gateway
+        mmd_injected = self._inject_mmd_from_gateway(messages, session_id)
+
+        # Step 3: Incremental compression check
+        # If we're approaching the threshold (>60%), request a light compact
+        # to do fastpath replay without waiting for the full threshold trigger.
+        estimated = _estimate_tokens(messages)
+        soft_threshold = int((self.threshold_tokens or self.context_length or 200000) * 0.60)
+        if soft_threshold > 0 and estimated >= soft_threshold and self._check_available():
+            logger.info(
+                "[tencentdb-offload] pre_llm_call: %d tokens >= %d soft threshold — requesting incremental compact",
+                estimated, soft_threshold,
+            )
+            # Use compact with ratio to do fastpath replay + mild compression
+            # This is lighter than the full threshold-triggered compact()
+            try:
+                self._incremental_compact(messages, session_id, estimated)
+            except Exception as exc:
+                logger.debug("[tencentdb-offload] pre_llm_call incremental compact error: %s", exc)
+
+        return None  # no context injection needed — modifications are in-place
+
+    def _filter_heartbeat_messages(self, messages: List[Dict[str, Any]]) -> int:
+        """Remove heartbeat tool_use/tool_result pairs from messages.
+
+        Mirrors OpenClaw's ``filterHeartbeatMessages``.  Heartbeat tool calls
+        are internal probes that add noise to the context.  Removing them
+        saves tokens and avoids confusing the LLM.
+
+        Returns count of removed messages.
+        """
+        # Collect heartbeat tool_use IDs
+        heartbeat_ids: set = set()
+        for msg in messages:
+            role = msg.get("role", "")
+            if role != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") not in ("tool_use", "toolCall"):
+                    continue
+                raw_input = block.get("input", block.get("arguments", ""))
+                raw_str = str(raw_input) if not isinstance(raw_input, str) else raw_input
+                if "HEARTBEAT" in raw_str:
+                    heartbeat_ids.add(block.get("id", ""))
+
+        if not heartbeat_ids:
+            return 0
+
+        removed = 0
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            role = msg.get("role", "")
+
+            # OpenAI tool result with heartbeat tool_call_id
+            if role in ("tool", "function", "toolResult", "tool_result"):
+                tc_id = msg.get("tool_call_id", "")
+                if tc_id and tc_id in heartbeat_ids:
+                    messages.pop(i)
+                    removed += 1
+                    continue
+
+            # Anthropic user msg with tool_result blocks
+            if role == "user" and isinstance(msg.get("content"), list):
+                new_blocks = []
+                msg_removed = False
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        if block.get("tool_use_id", "") in heartbeat_ids:
+                            msg_removed = True
+                            continue
+                    new_blocks.append(block)
+                if msg_removed:
+                    if new_blocks:
+                        messages[i] = dict(msg)
+                        messages[i]["content"] = new_blocks
+                    else:
+                        messages.pop(i)
+                    removed += 1
+                    continue
+
+            # Assistant with heartbeat tool_use blocks
+            if role == "assistant" and isinstance(msg.get("content"), list):
+                new_blocks = []
+                msg_changed = False
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") in ("tool_use", "toolCall"):
+                        if block.get("id", "") in heartbeat_ids:
+                            msg_changed = True
+                            continue
+                    new_blocks.append(block)
+                if msg_changed:
+                    if new_blocks:
+                        messages[i] = dict(msg)
+                        messages[i]["content"] = new_blocks
+                    else:
+                        messages.pop(i)
+                    removed += 1
+
+        if removed > 0:
+            logger.info("[tencentdb-offload] filtered %d heartbeat messages", removed)
+        return removed
+
+    def _incremental_compact(
+        self, messages: List[Dict[str, Any]], session_id: str, estimated_tokens: int
+    ) -> None:
+        """Request lightweight incremental compression from Gateway.
+
+        Unlike the full compress(), this targets a higher ratio (keeping more)
+        and focuses on fastpath replay + mild replacement.  Used in pre_llm_call
+        when approaching but not yet at the threshold.
+        """
+        send_msgs = self._prepare_for_compact(messages, max_body_mb=0.5)
+
+        result = _post_json(
+            f"{self._gateway_url}/v2/offload/compact",
+            {
+                "session_id": session_id,
+                "messages": send_msgs,
+                "ratio": 0.65,  # lighter than the full compact ratio
+                "context_window": max(
+                    int((self.context_length or 200000) * 0.65 / 0.80), 100000
+                ),
+                "total_tokens": estimated_tokens,
+                "instance": self._instance_id,
+            },
+            self._headers,
+            30000,  # shorter timeout for incremental
+        )
+
+        if result is None or result.get("code") != 0 or not result.get("data"):
+            return
+
+        compacted = result["data"].get("messages", [])
+        if not compacted:
+            return
+
+        report = result["data"].get("report", {})
+        # Only apply if the compacted list is meaningfully shorter
+        if len(compacted) < len(messages):
+            messages.clear()
+            messages.extend(compacted)
+            logger.info(
+                "[tencentdb-offload] incremental compact: %d→%d messages (level=%s)",
+                len(send_msgs),
+                len(compacted),
+                report.get("resolvedLevel", "?"),
+            )
+
+    # ======================================================================
+    # Feature 2: L2 Mermaid canvas injection
+    # ======================================================================
+
+    _MMD_CONTEXT_MARKER = "_mmdContextMessage"
+    _MMD_INJECTION_MARKER = "_mmdInjection"
+
+    def _inject_mmd_from_gateway(
+        self, messages: List[Dict[str, Any]], session_id: str
+    ) -> bool:
+        """Fetch MMD files from Gateway and inject context messages.
+
+        Calls POST /v2/offload/query-mmd to get active + history MMD files,
+        then injects them as user messages with <current_task_context> and
+        <history_task_context> tags.
+
+        Mirrors OpenClaw's ``injectActiveMmd`` + ``injectHistoryMmds`` from
+        ``mmd-injector.ts`` and ``buildHistoryMmdInjection`` from
+        ``llm-input-l3.ts``.
+
+        Returns True if any MMD was injected.
+        """
+        if not self._check_available():
+            return False
+
+        result = _post_json(
+            f"{self._gateway_url}/v2/offload/query-mmd",
+            {"session_id": session_id},
+            self._headers,
+            5000,
+        )
+
+        if result is None or result.get("code") != 0 or not result.get("data"):
+            return False
+
+        mmd_data = result["data"]
+        mmds = mmd_data.get("mmds", [])
+        current_mmd = mmd_data.get("currentMmd")
+
+        if not mmds:
+            return False
+
+        # Remove existing MMD injections (version dedup)
+        self._remove_existing_mmd_injections(messages)
+
+        injected = False
+        token_budget = int((self.context_length or 200000) * 0.05)  # 5% of context for MMD
+
+        # Separate active from history MMDs
+        active_mmd_content = None
+        active_mmd_filename = None
+        active_version = None
+        history_mmds: List[Dict[str, str]] = []
+
+        for mmd in mmds:
+            filename = mmd.get("filename", "")
+            content = mmd.get("content", "")
+            version = mmd.get("version", "")
+            if not content or not content.strip():
+                continue
+
+            if filename == current_mmd:
+                active_mmd_content = content
+                active_mmd_filename = filename
+                active_version = version
+            else:
+                history_mmds.append({"filename": filename, "content": content, "version": version})
+
+        # Inject history MMDs first (oldest → newest)
+        hist_injected = self._inject_history_mmds(
+            messages, history_mmds, token_budget
+        )
+
+        # Inject active MMD
+        active_injected = False
+        if active_mmd_content:
+            active_injected = self._inject_active_mmd(
+                messages, active_mmd_filename, active_mmd_content, active_version
+            )
+
+        injected = hist_injected or active_injected
+        if injected:
+            logger.info(
+                "[tencentdb-offload] MMD injection: active=%s, history=%d",
+                "yes" if active_injected else "no",
+                hist_injected,
+            )
+        return injected
+
+    def _inject_active_mmd(
+        self,
+        messages: List[Dict[str, Any]],
+        filename: Optional[str],
+        content: str,
+        version: Optional[str],
+    ) -> bool:
+        """Inject the active MMD as a <current_task_context> message.
+
+        Mirrors OpenClaw's ``injectActiveMmd`` + ``buildActiveMmdText``.
+        """
+        text = self._build_active_mmd_text(filename, content)
+
+        mmd_msg: Dict[str, Any] = {
+            "role": "user",
+            "content": text,
+            self._MMD_CONTEXT_MARKER: "active",
+            "_mmdVersion": version or _hash_content(content),
+            "_mmdFilename": filename,
+        }
+
+        insert_idx = self._find_active_mmd_insertion_point(messages)
+        messages.insert(insert_idx, mmd_msg)
+        return True
+
+    def _inject_history_mmds(
+        self,
+        messages: List[Dict[str, Any]],
+        history_mmds: List[Dict[str, str]],
+        token_budget: int,
+    ) -> int:
+        """Inject history MMD files for deleted/aggressive-compressed entries.
+
+        Mirrors OpenClaw's ``injectHistoryMmds`` + ``buildHistoryMmdText``.
+        Injects newest first, respects token budget.
+        """
+        if not history_mmds:
+            return 0
+
+        # Sort newest first (by version), then inject oldest-first in messages
+        history_mmds.sort(key=lambda m: m.get("version", ""), reverse=True)
+
+        injected: List[Dict[str, Any]] = []
+        used_tokens = 0
+
+        for mmd in history_mmds:
+            filename = mmd.get("filename", "")
+            content = mmd.get("content", "")
+            text = self._build_history_mmd_text(filename, content)
+            tokens = len(text) // 3  # rough estimate
+
+            if used_tokens + tokens > token_budget:
+                continue
+
+            injected.append({
+                "role": "user",
+                "content": text,
+                self._MMD_INJECTION_MARKER: True,
+                "_mmdFilename": filename,
+            })
+            used_tokens += tokens
+
+        if not injected:
+            return 0
+
+        # Reverse to chronological order (oldest first)
+        injected.reverse()
+
+        insert_idx = self._find_history_mmd_insertion_point(messages)
+        for i, msg in enumerate(injected):
+            messages.insert(insert_idx + i, msg)
+
+        return len(injected)
+
+    def _remove_existing_mmd_injections(self, messages: List[Dict[str, Any]]) -> int:
+        """Remove existing MMD injection messages for version dedup.
+
+        Mirrors OpenClaw's ``removeExistingMmdInjections`` + ``removeMmdMessages``.
+        """
+        removed = 0
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get(self._MMD_INJECTION_MARKER) or msg.get(self._MMD_CONTEXT_MARKER):
+                messages.pop(i)
+                removed += 1
+        return removed
+
+    def _find_active_mmd_insertion_point(self, messages: List[Dict[str, Any]]) -> int:
+        """Find the insertion point for the active MMD message.
+
+        Strategy: insert after the latest user message in the second half,
+        or before the trailing tool loop.  Never before system message.
+        Mirrors OpenClaw's ``findActiveMmdInsertionPoint``.
+        """
+        if len(messages) <= 2:
+            return min(1, len(messages))
+
+        # Find latest non-MMD user message
+        latest_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get(self._MMD_CONTEXT_MARKER) or msg.get(self._MMD_INJECTION_MARKER):
+                continue
+            if msg.get("role") == "user":
+                latest_user_idx = i
+                break
+
+        if latest_user_idx >= 0:
+            if latest_user_idx == len(messages) - 1:
+                insert_idx = latest_user_idx  # before last (user prompt stays last)
+            else:
+                insert_idx = latest_user_idx + 1
+        else:
+            # Fallback: in the second half
+            insert_idx = max(1, len(messages) - 30)
+
+        # Guard: don't insert between assistant(tool_use) and its tool_result
+        insert_idx = self._adjust_for_tool_call_pair(messages, insert_idx)
+
+        # Never insert before system message
+        if insert_idx == 0 and messages and messages[0].get("role") == "system":
+            insert_idx = 1
+
+        return insert_idx
+
+    def _find_history_mmd_insertion_point(self, messages: List[Dict[str, Any]]) -> int:
+        """Find insertion point for history MMD (before active MMD)."""
+        for i, msg in enumerate(messages):
+            if msg.get(self._MMD_CONTEXT_MARKER) == "active":
+                return i
+        return self._find_active_mmd_insertion_point(messages)
+
+    def _adjust_for_tool_call_pair(
+        self, messages: List[Dict[str, Any]], insert_idx: int
+    ) -> int:
+        """Adjust insertion index to avoid splitting tool_call/tool_result pairs."""
+        if insert_idx <= 0 or insert_idx >= len(messages):
+            return insert_idx
+
+        msg = messages[insert_idx]
+        role = msg.get("role", "")
+
+        # Don't insert at a tool_result position
+        if _is_tool_result(msg):
+            # Walk back past the assistant tool_use
+            i = insert_idx - 1
+            while i >= 0:
+                prev_role = messages[i].get("role", "")
+                if prev_role == "assistant":
+                    return i
+                if not _is_tool_result(messages[i]):
+                    break
+                i -= 1
+
+        # Don't insert right after assistant with tool_calls (before its tool_result)
+        if insert_idx > 0:
+            prev = messages[insert_idx - 1]
+            if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                return insert_idx - 1
+
+        return insert_idx
+
+    @staticmethod
+    def _build_active_mmd_text(filename: Optional[str], content: str) -> str:
+        """Build active MMD injection text with <current_task_context> tag.
+
+        Mirrors OpenClaw's ``buildActiveMmdText``.
+        """
+        task_goal = ""
+        import re
+        meta_match = re.match(r"^%%\{\s*(.*?)\s*\}%%", content)
+        if meta_match:
+            try:
+                import json as _json
+                meta = _json.loads("{" + meta_match.group(1) + "}")
+                task_goal = meta.get("taskGoal", "")
+            except Exception:
+                pass
+
+        lines = [
+            "<current_task_context>",
+            "【当前活跃任务的mermaid流程图】这是你最近正在执行的任务的阶段性记录。",
+        ]
+        if task_goal:
+            lines.append(f"**任务目标:** {task_goal}")
+        if filename:
+            lines.append(f"**任务文件:** {filename}")
+        lines.extend([
+            "```mermaid",
+            content,
+            "```",
+            "标记为 \"doing\" 的节点是近期焦点，\"done\" 的已完成。请参考此保持方向感，避免重复已完成的工作。",
+            "</current_task_context>",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_history_mmd_text(filename: str, content: str) -> str:
+        """Build history MMD injection text with <history_task_context> tag.
+
+        Mirrors OpenClaw's ``buildHistoryMmdText``.
+        """
+        task_goal = ""
+        import re
+        meta_match = re.match(r"^%%\{\s*(.*?)\s*\}%%", content)
+        if meta_match:
+            try:
+                import json as _json
+                meta = _json.loads("{" + meta_match.group(1) + "}")
+                task_goal = meta.get("taskGoal", "")
+            except Exception:
+                pass
+
+        lines = [
+            f'<history_task_context file="{filename}">',
+            "【历史任务记录】以下是此前完成的任务的概要。",
+        ]
+        if task_goal:
+            lines.append(f"**任务目标:** {task_goal}")
+        lines.extend([
+            "",
+            "```mermaid",
+            content,
+            "```",
+            "</history_task_context>",
+        ])
+        return "\n".join(lines)
+
+    # ======================================================================
+    # Feature 3: Reclaimer — cleanup of stale session data
+    # ======================================================================
+
+    def reclaim(self, retention_days: int = 7) -> Dict[str, int]:
+        """Reclaim stale session data by calling Gateway cleanup.
+
+        In the official OpenClaw plugin, the reclaimer runs a 5-step cleanup
+        over local disk (expired JSONL, orphan refs, expired MMDs, log rotation,
+        registry pruning).  Since our plugin delegates storage to the Gateway,
+        we trigger cleanup via a Gateway request.
+
+        Also clears local session registry entries for sessions older than
+        ``retention_days``.
+        """
+        stats = {"local_sessions_pruned": 0}
+
+        if retention_days < 3:
+            return stats
+
+        cutoff = time.time() - retention_days * 86400
+
+        # Prune local session registry
+        if self._session_registry:
+            pruned = self._session_registry.prune_expired(cutoff)
+            stats["local_sessions_pruned"] = pruned
+            logger.info("[tencentdb-offload] reclaim: pruned %d expired local sessions", pruned)
+
+        return stats
+
+    # ======================================================================
+    # Feature 4: pre_llm_call hook (registered in __init__.py)
+    # ======================================================================
+    # See pre_llm_call method above — registered via pre_llm_call hook
+    # in __init__.py.
+
+    # ======================================================================
+    # Feature 5: SessionRegistry — multi-session state management
+    # ======================================================================
+
+    def get_session_registry(self) -> "SessionRegistry":
+        """Return the SessionRegistry, creating one if needed."""
+        if self._session_registry is None:
+            self._session_registry = SessionRegistry(max_cached=20)
+        return self._session_registry
+
+
+# ---------------------------------------------------------------------------
+# Helper: content hashing (for MMD version dedup)
+# ---------------------------------------------------------------------------
+
+def _hash_content(s: str) -> str:
+    """Hash content for MMD version dedup.  Mirrors OpenClaw hashContent."""
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# SessionRegistry — per-session state with LRU eviction
+# ---------------------------------------------------------------------------
+
+class SessionRegistry:
+    """Per-session state tracking with LRU eviction.
+
+    Mirrors OpenClaw's ``SessionRegistry`` (session-registry.ts).  Each
+    session gets an isolated ``SessionState`` holding processed tool call IDs,
+    offloaded IDs, and MMD injection versions.  LRU eviction keeps memory
+    bounded.
+
+    In our Gateway-backed architecture, the heavy state lives server-side.
+    This registry tracks lightweight client-side state for fastpath replay
+    and MMD version dedup.
+    """
+
+    def __init__(self, max_cached: int = 20) -> None:
+        self._sessions: Dict[str, SessionState] = {}
+        self._max_cached = max_cached
+        self._lock = threading.Lock()
+
+    def resolve(self, session_id: str) -> SessionState:
+        """Get or create a per-session state.  Thread-safe with LRU eviction."""
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is not None:
+                entry.last_access_ms = time.time() * 1000
+                return entry
+
+            entry = SessionState(session_id=session_id)
+            self._sessions[session_id] = entry
+
+            # LRU eviction
+            if len(self._sessions) > self._max_cached:
+                self._evict_oldest()
+
+            return entry
+
+    def get(self, session_id: str) -> Optional[SessionState]:
+        """Look up an existing session (does not create)."""
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is not None:
+                entry.last_access_ms = time.time() * 1000
+            return entry
+
+    def prune_expired(self, cutoff_epoch_s: float) -> int:
+        """Remove sessions whose last access predates cutoff.  Thread-safe."""
+        with self._lock:
+            to_remove = [
+                sid for sid, state in self._sessions.items()
+                if state.last_access_ms / 1000 < cutoff_epoch_s
+            ]
+            for sid in to_remove:
+                del self._sessions[sid]
+            return len(to_remove)
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def keys(self):
+        with self._lock:
+            return list(self._sessions.keys())
+
+    def values(self):
+        with self._lock:
+            return list(self._sessions.values())
+
+    def _evict_oldest(self) -> None:
+        """Evict the least-recently-accessed session.  Caller holds lock."""
+        oldest_key: Optional[str] = None
+        oldest_ms = float("inf")
+        for sid, state in self._sessions.items():
+            if state.last_access_ms < oldest_ms:
+                oldest_ms = state.last_access_ms
+                oldest_key = sid
+        if oldest_key is not None:
+            del self._sessions[oldest_key]
+
+
+class SessionState:
+    """Per-session state for offload tracking.
+
+    Mirrors a subset of OpenClaw's ``OffloadStateManager`` that's relevant
+    for client-side operations (fastpath replay, MMD dedup, processed ID
+    tracking).  Server-side state (entries.jsonl, offload entries) lives
+    on the Gateway.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.last_access_ms: float = time.time() * 1000
+
+        # Tool call IDs already processed (dedup prevention)
+        self.processed_tool_call_ids: set = set()
+        # Tool call IDs confirmed offloaded (fastpath replay candidates)
+        self.confirmed_offload_ids: set = set()
+        # Tool call IDs that were aggressively deleted
+        self.deleted_offload_ids: set = set()
+
+        # MMD injection version tracking (filename → version hash)
+        self.injected_mmd_versions: Dict[str, str] = {}
+
+        # Cached MMD data from last query-mmd call
+        self.cached_mmds: Optional[List[Dict[str, str]]] = None
+        self.cached_current_mmd: Optional[str] = None
+        self.cached_mmd_time: float = 0.0
+
+        # Compression tracking
+        self.compression_count: int = 0
+        self.last_compact_time: float = 0.0
+
+    def is_processed(self, tool_call_id: str) -> bool:
+        return tool_call_id in self.processed_tool_call_ids
+
+    def mark_processed(self, tool_call_id: str) -> None:
+        self.processed_tool_call_ids.add(tool_call_id)
+
+    def is_offloaded(self, tool_call_id: str) -> bool:
+        return tool_call_id in self.confirmed_offload_ids
+
+    def mark_offloaded(self, tool_call_id: str) -> None:
+        self.confirmed_offload_ids.add(tool_call_id)
+
+    def is_deleted(self, tool_call_id: str) -> bool:
+        return tool_call_id in self.deleted_offload_ids
+
+    def mark_deleted(self, tool_call_id: str) -> None:
+        self.deleted_offload_ids.add(tool_call_id)
+
+    def get_mmd_version(self, filename: str) -> Optional[str]:
+        return self.injected_mmd_versions.get(filename)
+
+    def set_mmd_version(self, filename: str, version: str) -> None:
+        self.injected_mmd_versions[filename] = version
+
+    def clear_mmd_versions(self) -> None:
+        self.injected_mmd_versions.clear()
