@@ -139,6 +139,41 @@ def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
     return int(total_chars / _ROUGH_CHARS_PER_TOKEN)
 
 
+def _extract_text_content(content: Any) -> str:
+    """Flatten message content (string or list of blocks) into a single text string.
+
+    Only ``text`` blocks contribute; ``tool_use`` / ``tool_result`` blocks are
+    skipped so we don't pull raw tool I/O into recent-message snapshots.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif "text" in block and isinstance(block["text"], str):
+                    parts.append(block["text"])
+        return " ".join(parts)
+    return ""
+
+
+def _extract_last_user_prompt(messages: List[Dict[str, Any]]) -> str:
+    """Return text of the most recent user message that is NOT a tool_result.
+
+    Used as the L1.5 ``prompt`` field for ingest.  Returns "" if no suitable
+    user message exists.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        if _is_tool_result(msg):
+            continue
+        return _extract_text_content(msg.get("content", ""))
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Context Engine
 # ---------------------------------------------------------------------------
@@ -313,6 +348,12 @@ class TencentDBOffloadEngine(ContextEngine):
             session_id,
         )
 
+        # NEW: ingest full messages BEFORE _prepare_for_compact truncates them,
+        # so tool pairs and recent context are preserved in TencentDB even if
+        # the compaction step later drops them.  Fire-and-forget — failures
+        # are logged but never block the compact flow.
+        self._ingest_before_compact(messages, session_id)
+
         # Limit messages sent to Gateway to avoid HTTP body too large (Broken pipe).
         # Keep system + first N + last M, truncate middle tool results.
         send_msgs = self._prepare_for_compact(messages)
@@ -323,8 +364,14 @@ class TencentDBOffloadEngine(ContextEngine):
                 "session_id": session_id,
                 "messages": send_msgs,
                 "ratio": self._compact_ratio,
-                "context_window": self.context_length or 200000,
+                # Pass a context_window that makes Gateway's ratio land in mild/aggressive range.
+                # Gateway uses: ratio = totalTokens / contextWindow, then resolveLevel(ratio)
+                #   mild >= 0.5, aggressive >= 0.85, emergency >= 0.95
+                # We want ratio ≈ 0.6-0.8 when our threshold triggers, so:
+                # contextWindow = totalTokens / 0.7
+                "context_window": max(int(tokens / 0.7), 100000),
                 "total_tokens": tokens,
+                "instance": self._instance_id,
             },
             self._headers,
             self._compact_timeout_ms,
@@ -366,17 +413,17 @@ class TencentDBOffloadEngine(ContextEngine):
     # -- Message preparation for compact API ---------------------------------
 
     def _prepare_for_compact(
-        self, messages: List[Dict[str, Any]], max_body_mb: float = 0.5
+        self, messages: List[Dict[str, Any]], max_body_mb: float = 4.0
     ) -> List[Dict[str, Any]]:
-        """Reduce message payload size before sending to compact API.
+        """Reduce message payload before sending to compact API.
 
-        Adaptive strategy aligned with OpenClaw ``context-engine.ts``:
-          Step 1 — keep ALL messages if body <= max_body_mb (no truncation)
-          Step 2 — truncate each tool result to 2000 chars (TOOL_RESULT_TRUNCATE_CHARS)
-          Step 3 — if still too large, truncate tool results to 500 chars
-          Step 4 — last resort: keep head(4) + tail(N) sized by body ratio
+        Always truncate tool results to 500 chars (unconditionally).
+        This is critical because:
+          1. Gateway's L1 extraction is async and entries.jsonl may be empty
+          2. Short tool results keep ratio low → Gateway stays in fastpath/mild
+          3. Original tool results are useless after compression anyway
 
-        Body size is logged at every step for debugging.
+        Then apply head+tail truncation if body still exceeds max_body_mb.
         """
         import json as _json
 
@@ -384,46 +431,28 @@ class TencentDBOffloadEngine(ContextEngine):
             return len(_json.dumps(msgs, ensure_ascii=False).encode("utf-8")) / (1024 * 1024)
 
         n = len(messages)
-
-        # Step 1: no truncation if body fits the Gateway limit
         before = _body_mb(messages)
-        logger.info(
-            "[tencentdb-offload] prepare: %d msgs, %.2fMB (limit %.1fMB)",
-            n, before, max_body_mb,
-        )
-        if before <= max_body_mb:
-            return messages
 
-        # Step 2: truncate each tool result to 2000 chars (matches reference)
-        result = [_truncate_tool_result(msg, max_chars=2000) for msg in messages]
-        after = _body_mb(result)
-        logger.info(
-            "[tencentdb-offload] prepare step2 (tool→2000): %.2fMB → %.2fMB, %d msgs preserved",
-            before, after, len(result),
-        )
-        if after <= max_body_mb:
-            return result
-
-        # Step 3: aggressive — truncate tool results to 500 chars
+        # Step 1: Always truncate tool results to 500 chars (unconditional)
         result = [_truncate_tool_result(msg, max_chars=500) for msg in messages]
         after = _body_mb(result)
         logger.info(
-            "[tencentdb-offload] prepare step3 (tool→500): %.2fMB → %.2fMB, %d msgs preserved",
-            before, after, len(result),
+            "[tencentdb-offload] prepare: %d msgs, %.2fMB → %.2fMB (tool→500, unconditional)",
+            n, before, after,
         )
-        if after <= max_body_mb:
-            return result
 
-        # Step 4: last resort — keep head(4) + tail(N) by body-size ratio
-        keep = min(max(8, int(n * max_body_mb / after)), len(result))
-        head = result[:4]
-        tail = result[-(keep - 4):] if keep > 4 else []
-        result = head + tail
-        after = _body_mb(result)
-        logger.info(
-            "[tencentdb-offload] prepare step4 (head+tail): %d→%d msgs, %.2fMB → %.2fMB (dropped middle)",
-            n, len(result), before, after,
-        )
+        # Step 2: head+tail truncation if body still exceeds limit
+        if after > max_body_mb:
+            keep = min(max(8, int(n * max_body_mb / after)), len(result))
+            head = result[:4]
+            tail = result[-(keep - 4):] if keep > 4 else []
+            result = head + tail
+            after = _body_mb(result)
+            logger.info(
+                "[tencentdb-offload] prepare step2 (head+tail): %d→%d msgs, %.2fMB → %.2fMB",
+                n, len(result), before, after,
+            )
+
         return result
 
     # -- Fallback compaction ---------------------------------------------
@@ -551,6 +580,227 @@ class TencentDBOffloadEngine(ContextEngine):
             self._ingest_timeout_ms,
         )
         # Intentionally ignore result — fire and forget
+
+    # -- Pre-compact ingestion (NEW — preserves info before truncation) ---
+
+    def _extract_tool_pairs(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Scan ``messages`` and match assistant(tool_use) → tool(tool_result) pairs.
+
+        Handles both OpenAI format (``tool_calls`` + role="tool" results) and
+        Anthropic format (``tool_use`` / ``tool_result`` content blocks).
+        Returns ``[{tool_name, tool_call_id, params, result, timestamp, duration_ms}]``.
+        """
+        try:
+            import json as _json
+        except ImportError:  # pragma: no cover — json is stdlib
+            _json = None
+
+        pending: Dict[str, Dict[str, Any]] = {}  # tool_call_id → call metadata
+        pairs: List[Dict[str, Any]] = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+
+            # ---- assistant: collect tool_use calls (OpenAI + Anthropic) ----
+            if role == "assistant":
+                # OpenAI: tool_calls=[{id, function:{name, arguments}}]
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id", "")
+                    if not tc_id:
+                        continue
+                    fn = tc.get("function") or {}
+                    raw_args = fn.get("arguments", "{}")
+                    if isinstance(raw_args, str):
+                        try:
+                            params = _json.loads(raw_args) if _json else raw_args
+                        except (ValueError, TypeError):
+                            params = raw_args
+                    elif isinstance(raw_args, dict):
+                        params = raw_args
+                    else:
+                        params = {}
+                    pending[tc_id] = {
+                        "tool_name": fn.get("name", ""),
+                        "params": params,
+                        "timestamp": msg.get("timestamp", ""),
+                    }
+                # Anthropic: content=[{type:"tool_use", id, name, input}]
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        tc_id = block.get("id", "")
+                        if not tc_id:
+                            continue
+                        pending[tc_id] = {
+                            "tool_name": block.get("name", ""),
+                            "params": block.get("input", {}) or {},
+                            "timestamp": msg.get("timestamp", ""),
+                        }
+
+            # ---- OpenAI tool result: role in {tool, function, ...} ----
+            elif role in ("tool", "function", "toolResult", "tool_result"):
+                tc_id = msg.get("tool_call_id", "")
+                if tc_id and tc_id in pending:
+                    call = pending.pop(tc_id)
+                    pairs.append(self._build_tool_pair(
+                        call["tool_name"], tc_id, call["params"],
+                        msg.get("content", ""), call["timestamp"],
+                        msg.get("duration_ms"),
+                    ))
+
+            # ---- Anthropic tool_result: user msg with tool_result blocks ----
+            elif role == "user" and isinstance(msg.get("content"), list):
+                for block in msg["content"]:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    tc_id = block.get("tool_use_id", "")
+                    if not tc_id or tc_id not in pending:
+                        continue
+                    raw = block.get("content", "")
+                    if isinstance(raw, list):
+                        result_text = " ".join(
+                            b.get("text", "") for b in raw
+                            if isinstance(b, dict) and isinstance(b.get("text"), str)
+                        )
+                    else:
+                        result_text = str(raw)
+                    call = pending.pop(tc_id)
+                    pairs.append(self._build_tool_pair(
+                        call["tool_name"], tc_id, call["params"],
+                        result_text, call["timestamp"],
+                        msg.get("duration_ms"),
+                    ))
+
+        return pairs
+
+    @staticmethod
+    def _build_tool_pair(
+        tool_name: str,
+        tool_call_id: str,
+        params: Any,
+        result: str,
+        timestamp: Any,
+        duration_ms: Any,
+    ) -> Dict[str, Any]:
+        """Build a tool-pair payload entry, truncating huge results."""
+        pair: Dict[str, Any] = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "params": params,
+            "result": result[:2000] if isinstance(result, str) else str(result)[:2000],
+            "timestamp": timestamp or "",
+        }
+        if duration_ms is not None:
+            pair["duration_ms"] = duration_ms
+        return pair
+
+    def _build_recent_messages(
+        self, messages: List[Dict[str, Any]], max_msgs: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Return recent user/assistant text messages, each truncated to 400 chars.
+
+        Mirrors OpenClaw ``buildRecentMessages``: skips tool messages, tool_result
+        user messages, assistant tool_use-only messages, heartbeats, and very
+        short messages.  Keeps the last ``max_msgs`` entries.
+        """
+        out: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "")
+
+            # Skip OpenAI-format tool results
+            if role in ("tool", "function", "toolResult", "tool_result"):
+                continue
+            # Skip Anthropic-format tool_result (user msg with tool_result blocks)
+            if _is_tool_result(msg):
+                continue
+
+            if role == "user":
+                text = _extract_text_content(msg.get("content", ""))
+                if len(text) <= 5:
+                    continue
+            elif role == "assistant":
+                text = _extract_text_content(msg.get("content", ""))
+                if len(text) <= 10:
+                    continue
+            else:
+                # Skip system / unknown roles
+                continue
+
+            if "HEARTBEAT" in text or "heartbeat" in text:
+                continue
+
+            out.append({"role": role, "content": text[:400]})
+
+        return out[-max_msgs:]
+
+    def _ingest_before_compact(
+        self, messages: List[Dict[str, Any]], session_id: str
+    ) -> None:
+        """Ingest full ``messages`` to ``/v2/offload/ingest`` before compaction truncates them.
+
+        Extracts tool pairs + recent text messages + last user prompt and fires
+        them at the Gateway.  Fire-and-forget: any failure (network, server,
+        unexpected exception) is logged and swallowed so ``compress()`` continues
+        to the compact step uninterrupted.
+        """
+        if not self._check_available():
+            return
+
+        try:
+            tool_pairs = self._extract_tool_pairs(messages)
+            recent_messages = self._build_recent_messages(messages)
+            prompt = _extract_last_user_prompt(messages)
+
+            if not tool_pairs and not recent_messages and not prompt:
+                logger.debug("[tencentdb-offload] ingest: nothing to send")
+                return
+
+            body: Dict[str, Any] = {
+                "session_id": session_id,
+                "tool_pairs": tool_pairs,
+                "recent_messages": recent_messages,
+            }
+            if prompt:
+                body["prompt"] = prompt[:500]
+
+            logger.info(
+                "[tencentdb-offload] ingest: %d tool_pairs, %d recent_messages",
+                len(tool_pairs),
+                len(recent_messages),
+            )
+
+            result = _post_json(
+                f"{self._gateway_url}/v2/offload/ingest",
+                body,
+                self._headers,
+                self._ingest_timeout_ms,
+            )
+            if result is None:
+                logger.warning(
+                    "[tencentdb-offload] ingest failed: HTTP request failed "
+                    "(continuing with compact)"
+                )
+            elif result.get("code", 0) != 0:
+                logger.warning(
+                    "[tencentdb-offload] ingest failed: code=%s msg=%s "
+                    "(continuing with compact)",
+                    result.get("code", "?"),
+                    result.get("message", "unknown"),
+                )
+        except Exception as exc:
+            logger.warning(
+                "[tencentdb-offload] ingest failed: %s (continuing with compact)", exc
+            )
 
     # -- New session carry-over ------------------------------------------
 
