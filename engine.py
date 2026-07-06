@@ -364,12 +364,21 @@ class TencentDBOffloadEngine(ContextEngine):
                 "session_id": session_id,
                 "messages": send_msgs,
                 "ratio": self._compact_ratio,
-                # Pass a context_window that makes Gateway's ratio land in mild/aggressive range.
-                # Gateway uses: ratio = totalTokens / contextWindow, then resolveLevel(ratio)
-                #   mild >= 0.5, aggressive >= 0.85, emergency >= 0.95
-                # We want ratio ≈ 0.6-0.8 when our threshold triggers, so:
-                # contextWindow = totalTokens / 0.7
-                "context_window": max(int(tokens / 0.7), 100000),
+                # Compress hard: pick a context_window that lands the resolved level
+                # at "emergency" (>= 0.95) once our threshold triggers. Emergency runs
+                # the full cascade — fastpath + mild(entries-based) + aggressive +
+                # emergency deletion — so compression works whether or not L1 has
+                # finished populating entries.jsonl for this session's recent pairs.
+                #
+                # Math:
+                #   - aggressive target  = floor(W * (0.85 - 0.05)) = 0.80 * W
+                #   - emergency target   = floor(W * (0.85 - 0.10)) = 0.75 * W
+                #   - we want final size = compactRatio * context_length
+                #   - so W = compactRatio * context_length / 0.80  (rounds down through
+                #     aggressive then emergency, leaving ~compactRatio * context_length)
+                "context_window": max(
+                    int(self.context_length * self._compact_ratio / 0.80), 100000
+                ) if self.context_length else max(int(tokens / 0.7), 100000),
                 "total_tokens": tokens,
                 "instance": self._instance_id,
             },
@@ -417,13 +426,12 @@ class TencentDBOffloadEngine(ContextEngine):
     ) -> List[Dict[str, Any]]:
         """Reduce message payload before sending to compact API.
 
-        Always truncate tool results to 500 chars (unconditionally).
-        This is critical because:
-          1. Gateway's L1 extraction is async and entries.jsonl may be empty
-          2. Short tool results keep ratio low → Gateway stays in fastpath/mild
-          3. Original tool results are useless after compression anyway
-
-        Then apply head+tail truncation if body still exceeds max_body_mb.
+        Strategy: send the FULL messages when possible so Gateway sees the real
+        token ratio and picks the right compaction level. Only truncate when the
+        serialized body exceeds ``max_body_mb`` (risk of Broken pipe / HTTP 413),
+        and even then only truncate the largest tool_results to 2000 chars
+        (matching Gateway's TOOL_RESULT_TRUNCATE_CHARS constant) — never destroy
+        the whole conversation shape.
         """
         import json as _json
 
@@ -433,26 +441,51 @@ class TencentDBOffloadEngine(ContextEngine):
         n = len(messages)
         before = _body_mb(messages)
 
-        # Step 1: Always truncate tool results to 500 chars (unconditional)
-        result = [_truncate_tool_result(msg, max_chars=500) for msg in messages]
+        if before <= max_body_mb:
+            logger.info(
+                "[tencentdb-offload] prepare: %d msgs, %.2fMB ≤ %.2fMB cap — sending full",
+                n, before, max_body_mb,
+            )
+            return messages
+
+        # Body too large — truncate largest tool_results progressively until under cap.
+        # Work on a deep copy so caller's messages aren't mutated.
+        import copy
+        result = copy.deepcopy(messages)
+        TRUNC_CHARS = 2000  # matches Gateway's TOOL_RESULT_TRUNCATE_CHARS
+
+        def _tool_result_size(msg: Dict[str, Any]) -> int:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return len(content)
+            if isinstance(content, list):
+                return sum(
+                    len(b.get("text", b.get("content", ""))) if isinstance(b, dict) else 0
+                    for b in content
+                )
+            return 0
+
+        # Iteratively truncate the single largest tool_result until we fit
+        while _body_mb(result) > max_body_mb:
+            # Find the largest tool_result
+            biggest_idx = -1
+            biggest_size = 0
+            for i, msg in enumerate(result):
+                if not _is_tool_result(msg):
+                    continue
+                size = _tool_result_size(msg)
+                if size > biggest_size and size > TRUNC_CHARS:
+                    biggest_size = size
+                    biggest_idx = i
+            if biggest_idx < 0:
+                break  # nothing left to truncate
+            result[biggest_idx] = _truncate_tool_result(result[biggest_idx], max_chars=TRUNC_CHARS)
+
         after = _body_mb(result)
         logger.info(
-            "[tencentdb-offload] prepare: %d msgs, %.2fMB → %.2fMB (tool→500, unconditional)",
-            n, before, after,
+            "[tencentdb-offload] prepare: %d msgs, %.2fMB → %.2fMB (largest tool_results→%d chars)",
+            n, before, after, TRUNC_CHARS,
         )
-
-        # Step 2: head+tail truncation if body still exceeds limit
-        if after > max_body_mb:
-            keep = min(max(8, int(n * max_body_mb / after)), len(result))
-            head = result[:4]
-            tail = result[-(keep - 4):] if keep > 4 else []
-            result = head + tail
-            after = _body_mb(result)
-            logger.info(
-                "[tencentdb-offload] prepare step2 (head+tail): %d→%d msgs, %.2fMB → %.2fMB",
-                n, len(result), before, after,
-            )
-
         return result
 
     # -- Fallback compaction ---------------------------------------------
@@ -746,12 +779,16 @@ class TencentDBOffloadEngine(ContextEngine):
     def _ingest_before_compact(
         self, messages: List[Dict[str, Any]], session_id: str
     ) -> None:
-        """Ingest full ``messages`` to ``/v2/offload/ingest`` before compaction truncates them.
+        """Defensive backup ingest — primary ingest path is the post_tool_call hook.
 
-        Extracts tool pairs + recent text messages + last user prompt and fires
-        them at the Gateway.  Fire-and-forget: any failure (network, server,
-        unexpected exception) is logged and swallowed so ``compress()`` continues
-        to the compact step uninterrupted.
+        The hook fires per-tool-call and gives L1 time to populate entries.jsonl
+        before compression triggers. This method catches two edge cases the hook
+        misses:
+          1. Tool pairs from before the plugin loaded (e.g. session restore).
+          2. Hermes hosts where post_tool_call isn't emitted.
+
+        Fire-and-forget — failures are logged and swallowed so ``compress()``
+        continues to the compact step uninterrupted.
         """
         if not self._check_available():
             return

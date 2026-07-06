@@ -8,6 +8,7 @@ hooks it into the lifecycle.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +29,24 @@ def register(ctx):
 
     ctx.register_context_engine(engine)
 
-    # Optional: register after-tool-call hook for background ingest
+    # Register post_tool_call hook for background ingest.
+    # IMPORTANT: the valid Hermes hook name is "post_tool_call" (see
+    # hermes_cli.plugins.VALID_HOOKS); "after_tool_call" silently fails.
+    # This is the primary ingest path — every tool call triggers an async
+    # /ingest so the Gateway's L1 has time to populate entries.jsonl
+    # before should_compress() fires many turns later.
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
         try:
             register_hook(
-                hook_name="after_tool_call",
-                handler=_make_after_tool_call_handler(engine),
+                hook_name="post_tool_call",
+                handler=_make_post_tool_call_handler(engine),
             )
-            logger.info("[tencentdb-offload] registered after_tool_call hook")
+            logger.info("[tencentdb-offload] registered post_tool_call hook")
         except Exception as exc:
-            logger.debug(
-                "[tencentdb-offload] after_tool_call hook registration skipped: %s",
+            logger.warning(
+                "[tencentdb-offload] post_tool_call hook registration failed: %s "
+                "(L1 entries will not populate — compression will degrade)",
                 exc,
             )
 
@@ -79,35 +86,74 @@ def register(ctx):
     )
 
 
-def _make_after_tool_call_handler(engine):
-    """Create a hook handler that ingests tool pairs for L1 offload."""
+def _make_post_tool_call_handler(engine):
+    """Create a post_tool_call hook handler that ingests tool pairs for L1 offload.
+
+    Hermes emits ``post_tool_call`` with kwargs (see ``model_tools._emit_post_tool_call_hook``):
+      tool_name, args, result, tool_call_id, session_id, task_id, turn_id,
+      duration_ms, status, error_type, error_message
+    """
 
     def _handler(*args, **kwargs):
         try:
-            # Extract tool name, call id, params, result from hook args
-            tool_name = kwargs.get("tool_name") or (
-                args[0] if args else kwargs.get("name", "")
+            tool_name = kwargs.get("tool_name") or ""
+            tool_call_id = (
+                kwargs.get("tool_call_id")
+                or kwargs.get("call_id")
+                or kwargs.get("task_id")
+                or ""
             )
-            tool_call_id = kwargs.get("tool_call_id") or kwargs.get("call_id", "")
-            params = kwargs.get("params") or kwargs.get("arguments", {})
-            result = kwargs.get("result") or kwargs.get("output", "")
-            error = kwargs.get("error")
+            params = kwargs.get("args")
+            if params is None:
+                params = kwargs.get("params") or kwargs.get("arguments") or {}
+            result = kwargs.get("result")
+            error = kwargs.get("error_message") or kwargs.get("error")
+            duration_ms = kwargs.get("duration_ms")
+            session_id = kwargs.get("session_id")
 
-            # Build tool pair payload
+            if not tool_call_id:
+                logger.debug(
+                    "[tencentdb-offload] post_tool_call: skip (no tool_call_id, tool=%s)",
+                    tool_name,
+                )
+                return
+
+            # Bind session id if engine doesn't have one yet
+            if session_id and not engine._session_id:
+                engine.bind_session(str(session_id))
+
+            # Coerce result to a string — Hermes may pass dict / list / object.
+            # Match OpenClaw's ToolPair format: toolName/toolCallId/params/result/error/timestamp/durationMs.
+            result_str = result if isinstance(result, str) else _truncate(
+                str(result), 8000,
+            )
+
             pair = {
                 "tool_name": str(tool_name)[:200],
                 "tool_call_id": str(tool_call_id)[:200],
-                "params": _truncate(str(params), 4000),
-                "result": _truncate(str(result), 8000),
+                "params": _coerce_params(params),
+                "result": _truncate(result_str, 8000),
             }
             if error:
                 pair["error"] = _truncate(str(error), 2000)
+            if duration_ms is not None:
+                try:
+                    pair["duration_ms"] = int(duration_ms)
+                except (TypeError, ValueError):
+                    pass
 
             engine.ingest_tool_pairs([pair])
         except Exception as exc:
-            logger.debug("[tencentdb-offload] after_tool_call hook error: %s", exc)
+            logger.debug("[tencentdb-offload] post_tool_call hook error: %s", exc)
 
     return _handler
+
+
+def _coerce_params(params: Any) -> Any:
+    """Keep params as-is if dict/list; otherwise truncate the string form."""
+    if isinstance(params, (dict, list)):
+        return params
+    return _truncate(str(params), 4000)
 
 
 def _make_session_start_handler(engine):
