@@ -146,11 +146,14 @@ def _make_post_tool_call_handler(engine):
                 str(result), 8000,
             )
 
+            from datetime import datetime, timezone
+
             pair = {
                 "tool_name": str(tool_name)[:200],
                 "tool_call_id": str(tool_call_id)[:200],
                 "params": _coerce_params(params),
                 "result": _truncate(result_str, 8000),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             if error:
                 pair["error"] = _truncate(str(error), 2000)

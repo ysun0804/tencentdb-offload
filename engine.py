@@ -255,6 +255,55 @@ class TencentDBOffloadEngine(ContextEngine):
             self._compact_ratio,
         )
 
+    # -- Deepcopy support (for v0.18.0 subagent fork) -------------------
+
+    def __deepcopy__(self, memo: dict) -> "TencentDBOffloadEngine":
+        """Create a copy suitable for child-agent context engine inheritance.
+
+        v0.18.0 ``agent_init.py`` deep-copies the shared plugin singleton so a
+        child agent's ``update_model()`` can't mutate the parent's compressor
+        budget (#42449).  The default ``copy.deepcopy`` chokes on
+        ``threading.Lock`` and would silently fall back to the built-in
+        compressor.  We side-step that by constructing a fresh instance with
+        config re-read from env vars — only the mutable budget state carried by
+        the base ``ContextEngine`` (``last_prompt_tokens``,
+        ``compression_count``, etc.) is copied across.
+        """
+        import copy as _copy
+
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+
+        # Re-read config from env (same as __init__) — ensures the child
+        # picks up the same gateway / instance / ratio.
+        new._gateway_url = self._gateway_url
+        new._api_key = self._api_key
+        new._instance_id = self._instance_id
+        new._compact_ratio = self._compact_ratio
+        new._compact_timeout_ms = self._compact_timeout_ms
+        new._ingest_timeout_ms = self._ingest_timeout_ms
+
+        # Mutable budget state — copy from parent so the child starts with the
+        # same thresholds, not zeroes.
+        new.threshold_percent = self.threshold_percent
+        new.protect_first_n = self.protect_first_n
+        new.protect_last_n = self.protect_last_n
+        new.context_length = getattr(self, "context_length", 0)
+        new.last_prompt_tokens = getattr(self, "last_prompt_tokens", 0)
+        new.last_completion_tokens = getattr(self, "last_completion_tokens", 0)
+        new.last_total_tokens = getattr(self, "last_total_tokens", 0)
+        new.threshold_tokens = getattr(self, "threshold_tokens", 0)
+        new.compression_count = self.compression_count
+
+        # Fresh state — child agent gets its own lock + session tracking.
+        new._session_id = ""  # child will bind its own session
+        new._lock = threading.Lock()
+        new._available = self._available  # reuse cached health-check result
+        new._session_registry = None  # child starts with empty registry
+
+        return new
+
     # -- HTTP helpers ----------------------------------------------------
 
     @property

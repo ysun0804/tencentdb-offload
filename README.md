@@ -32,6 +32,7 @@
 - **心跳过滤**：自动移除 HEARTBEAT tool_use/result 消息对
 - **优雅降级**：Gateway 不可用时自动切换为尾部截断
 - **线程安全**：无锁 HTTP 调用 + 快照式状态修改
+- **子 Agent 兼容**：`__deepcopy__` 支持 v0.18.0 subagent fork（见下文）
 - **零外部依赖**：纯 Python 标准库（urllib, json, threading, logging）
 - **斜杠命令**：`/tencentdb-offload` 查看运行时状态
 
@@ -48,10 +49,11 @@ Hermes Agent
   │           ├── should_compress()  →   阈值检查（0.4 × context_window）
   │           ├── pre_llm_call()     →   心跳过滤 + MMD 注入 + 增量压缩
   │           ├── reclaim()          →   过期 session 清理
+  │           ├── __deepcopy__()     →   子 Agent fork 时复制预算状态
   │           └── _fallback_compress() →  本地尾部截断（Gateway 不可用时）
   │
   ├── post_tool_call hook
-  │     └── 每次工具调用后异步 ingest tool_pair
+  │     └── 每次工具调用后异步 ingest tool_pair（含 timestamp）
   │
   └── TencentDB Gateway :8420（Node.js，独立进程）
         ├── /v2/offload/compact    — 同步多级压缩
@@ -164,8 +166,8 @@ tencentdb-offload/
 
 ## 兼容性
 
-- **TencentDB Agent Memory v1.0.0+**（需 offload V2 API）
-- **Hermes Agent v0.17.0+**（需 `ContextEngine` 抽象类 + `register_context_engine` + `pre_llm_call` / `post_tool_call` hooks）
+- **TencentDB Agent Memory v1.0.0+**（需 offload V2 API，Zod schema 要求 `timestamp` 必填）
+- **Hermes Agent v0.18.0+**（需 `ContextEngine` 抽象类 + `register_context_engine` + `pre_llm_call` / `post_tool_call` hooks + subagent `__deepcopy__` 支持）
 - **Python 3.10+**
 - 纯标准库，无外部依赖
 - 仅通过 HTTP 通信，不需要 Node.js 运行时
@@ -177,8 +179,14 @@ tencentdb-offload/
 3. **compress() 无锁 HTTP** — 持锁快照 mutable state，释放锁后做 HTTP 调用，避免 30s compact 阻塞并发写入
 4. **pre_llm_call 替代 assemble()** — Hermes ContextEngine ABC 不含 assemble()，用 pre_llm_call hook 等效实现
 5. **context_window 动态计算** — 传 `tokens/0.7` 让 Gateway ratio 落在 mild 区间（0.5-0.85），触发完整压缩级联
+6. **`__deepcopy__` 预算继承** — v0.18.0 subagent fork 时 `copy.deepcopy(engine)` 会因 `threading.Lock` 失败，自定义 `__deepcopy__` 只复制预算状态（`compression_count`/`last_prompt_tokens` 等），lock 和 session 状态重建
 
 ## CHANGELOG
+
+### v0.4.1 (2026-07-07)
+- **修复 ingest timestamp 缺失**：Gateway v1.0.0 Zod schema 要求 `tool_pair.timestamp: z.string()` 必填，`post_tool_call` hook 漏了 `timestamp` 字段 → 全部 ingest 400 Bad Request → L1 无数据 → compact 失效 → 内置压缩接管（双压缩问题）。修复：加 `datetime.now(timezone.utc).isoformat()`
+- **`__deepcopy__` 支持**：v0.18.0 subagent fork 时 `copy.deepcopy(engine)` 因 `threading.Lock` 不能 pickle 而失败 → fallback 到内置压缩器。修复：自定义 `__deepcopy__` 复制预算状态、重建 lock/session
+- **兼容性升级**：Hermes v0.17.0 → v0.18.0，TencentDB Gateway v1.0.0 Zod schema
 
 ### v0.4.0 (2026-07-06)
 - **功能对齐官方 OpenClaw**：补齐 5 个关键差距
