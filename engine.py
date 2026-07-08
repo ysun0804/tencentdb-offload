@@ -474,7 +474,7 @@ class TencentDBOffloadEngine(ContextEngine):
     # -- Message preparation for compact API ---------------------------------
 
     def _prepare_for_compact(
-        self, messages: List[Dict[str, Any]], max_body_mb: float = 4.0
+        self, messages: List[Dict[str, Any]], max_body_mb: float = 5.0
     ) -> List[Dict[str, Any]]:
         """Reduce message payload before sending to compact API.
 

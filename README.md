@@ -120,7 +120,9 @@ Hermes Agent
 
 ## Gateway 配置
 
-在 `~/.memory-tencentdb/memory-tdai/tdai-gateway.json` 中添加 offload LLM 配置：
+### offload LLM 模型
+
+在 `~/.memory-tencentdb/hermes-tdai/tdai-gateway.json` 中添加 offload LLM 配置：
 
 ```json
 {
@@ -132,7 +134,20 @@ Hermes Agent
 }
 ```
 
-不配置此字段时，Gateway 的 L1 提取不会执行（ingest 返回 200 但不生成 entries.jsonl）。
+不配置此字段时，Gateway 的 L1 提取不会执行（ingest 返回 200 但不生成 entries.jsonl），L2 MMD 画布也不会生成。
+
+### body 大小限制
+
+Gateway 默认 body 限制 **1MB**，compact payload 通常 2-3MB 会被直接断连（Broken pipe / Connection reset）。
+
+在 launchctl plist 的 `EnvironmentVariables` 中设置：
+
+```xml
+<key>MEMORY_MAX_BODY_BYTES</key>
+<string>10485760</string>
+```
+
+或启动脚本中 `MEMORY_MAX_BODY_BYTES=10485760`（10MB）。
 
 ## 降级行为
 
@@ -166,7 +181,7 @@ tencentdb-offload/
 
 ## 兼容性
 
-- **TencentDB Agent Memory v1.0.0+**（需 offload V2 API，Zod schema 要求 `timestamp` 必填）
+- **TencentDB Agent Memory v1.0.0+**（需 offload V2 API，Zod schema 要求 `timestamp` 必填，`MEMORY_MAX_BODY_BYTES` 需设为 10MB+）
 - **Hermes Agent v0.18.0+**（需 `ContextEngine` 抽象类 + `register_context_engine` + `pre_llm_call` / `post_tool_call` hooks + subagent `__deepcopy__` 支持）
 - **Python 3.10+**
 - 纯标准库，无外部依赖
@@ -182,6 +197,11 @@ tencentdb-offload/
 6. **`__deepcopy__` 预算继承** — v0.18.0 subagent fork 时 `copy.deepcopy(engine)` 会因 `threading.Lock` 失败，自定义 `__deepcopy__` 只复制预算状态（`compression_count`/`last_prompt_tokens` 等），lock 和 session 状态重建
 
 ## CHANGELOG
+
+### v0.4.2 (2026-07-08)
+- **修复 compact Broken pipe**：Gateway 默认 body 限制 1MB，实际 payload 2.3MB 被直接断连。根因是 `MEMORY_MAX_BODY_BYTES` 环境变量未设置，fallback 到 1MB 默认值。修复：Gateway plist 加 `MEMORY_MAX_BODY_BYTES=10485760`（10MB）
+- **`max_body_mb` 调整**：4.0 → 5.0（安全网，低于 Gateway 10MB 限制。正常 2-3MB payload 发全量，仅极端情况截短 tool result）
+- **Gateway offload 配置**：`tdai-gateway.json` 加 `offload.l1Model/l15Model/l2Model`（MiniMax-M3），启用 L2 MMD 画布生成
 
 ### v0.4.1 (2026-07-07)
 - **修复 ingest timestamp 缺失**：Gateway v1.0.0 Zod schema 要求 `tool_pair.timestamp: z.string()` 必填，`post_tool_call` hook 漏了 `timestamp` 字段 → 全部 ingest 400 Bad Request → L1 无数据 → compact 失效 → 内置压缩接管（双压缩问题）。修复：加 `datetime.now(timezone.utc).isoformat()`
