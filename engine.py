@@ -248,6 +248,11 @@ class TencentDBOffloadEngine(ContextEngine):
         self._available: Optional[bool] = None  # lazy health check
         self._session_registry: Optional[SessionRegistry] = None  # Feature 5
 
+        # L1.5 state (v0.5.0)
+        self._cached_prompt: str = ""
+        self._cached_recent_messages: List[Dict[str, str]] = []
+        self._last_l15_hash: str = ""
+
         logger.info(
             "[tencentdb-offload] init: gateway=%s, instance=%s, ratio=%.2f",
             self._gateway_url,
@@ -301,6 +306,11 @@ class TencentDBOffloadEngine(ContextEngine):
         new._lock = threading.Lock()
         new._available = self._available  # reuse cached health-check result
         new._session_registry = None  # child starts with empty registry
+
+        # L1.5 state — child starts fresh (no cached prompt/hash)
+        new._cached_prompt = ""
+        new._cached_recent_messages = []
+        new._last_l15_hash = ""
 
         return new
 
@@ -646,10 +656,13 @@ class TencentDBOffloadEngine(ContextEngine):
         self,
         tool_pairs: List[Dict[str, Any]],
         prompt: str = None,
+        recent_messages: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Fire-and-forget: send tool-call/result pairs to offload server for L1 processing.
 
         Called after each tool execution.  Does not block the conversation.
+        When prompt and recent_messages are provided, Gateway uses them for
+        richer L1 extraction (ingestWithContext pattern).
         """
         if not self._check_available() or not tool_pairs:
             return
@@ -661,6 +674,11 @@ class TencentDBOffloadEngine(ContextEngine):
         }
         if prompt:
             body["prompt"] = prompt[:500]
+        if recent_messages:
+            body["recent_messages"] = [
+                {"role": m["role"], "content": m["content"][:300]}
+                for m in recent_messages[-5:]
+            ]
 
         _post_json(
             f"{self._gateway_url}/v2/offload/ingest",
@@ -832,6 +850,137 @@ class TencentDBOffloadEngine(ContextEngine):
 
         return out[-max_msgs:]
 
+    # -- L1.5 + ingestWithContext + localCompact (v0.5.0) ----------------
+
+    def _is_internal_prompt(self, prompt: str) -> bool:
+        """Detect internal prompts that should NOT trigger L1.5."""
+        if prompt.startswith("Pre-compaction"):
+            return True
+        if prompt.startswith("[Inter-session"):
+            return True
+        if "HEARTBEAT" in prompt or "heartbeat" in prompt:
+            return True
+        return False
+
+    def _format_context_for_l1(self, prompt: str, recent_messages: List[Dict[str, str]]) -> str:
+        """Format prompt + recent_messages into a context string for L1 extraction."""
+        parts = [f"User: {prompt[:500]}"]
+        if recent_messages:
+            parts.append("")
+            parts.append("Recent:")
+            for m in recent_messages[-5:]:
+                role = m.get("role", "?")
+                content = m.get("content", "")[:200]
+                parts.append(f"  {role}: {content}")
+        return "\n".join(parts)
+
+    def _trigger_l15_if_needed(
+        self, messages: List[Dict[str, Any]], session_id: str
+    ) -> None:
+        """Fire-and-forget L1.5: send prompt + recent_messages to Gateway.
+
+        Mirrors OpenClaw ``triggerL15IfNeeded``.  Runs on every new user
+        prompt so Gateway has real-time context for L1 extraction.
+        """
+        prompt = _extract_last_user_prompt(messages)
+        if not prompt or self._is_internal_prompt(prompt):
+            return
+
+        # Update cache for ingestWithContext
+        recent = self._build_recent_messages(messages, max_msgs=5)
+        self._cached_prompt = prompt[:500]
+        self._cached_recent_messages = recent
+
+        # Dedup: skip if same prompt hash
+        import hashlib
+        h = hashlib.md5(prompt.encode()).hexdigest()[:16]
+        if h == self._last_l15_hash:
+            return
+        self._last_l15_hash = h
+
+        if not self._check_available():
+            return
+
+        # Fire-and-forget in daemon thread
+        def _fire():
+            try:
+                _post_json(
+                    f"{self._gateway_url}/v2/offload/ingest",
+                    {
+                        "session_id": session_id,
+                        "tool_pairs": [],
+                        "prompt": prompt[:500],
+                        "recent_messages": [
+                            {"role": m["role"], "content": m["content"][:300]}
+                            for m in recent[-5:]
+                        ] if recent else [],
+                    },
+                    self._headers,
+                    self._ingest_timeout_ms,
+                )
+                logger.debug(
+                    "[tencentdb-offload] L1.5 sent: hash=%s, recent_msgs=%d",
+                    h, len(recent),
+                )
+            except Exception as exc:
+                logger.debug("[tencentdb-offload] L1.5 failed: %s", exc)
+
+        threading.Thread(target=_fire, daemon=True).start()
+
+    def _local_compact(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Tool-pair-aware local compaction (fallback when server unavailable).
+
+        Mirrors OpenClaw ``localCompact()``: scans from tail to find cut index,
+        then expands cut boundary to preserve tool_use/tool_result pairs.
+        """
+        target_tokens = int((self.context_length or 200000) * self._compact_ratio)
+        head_keep = self.protect_first_n
+        n = len(messages)
+
+        if n <= head_keep + 2:
+            return messages
+
+        # Step 1: scan from tail, accumulate tokens
+        cum = 0
+        cut = n
+        for i in range(n - 1, head_keep - 1, -1):
+            cum += _estimate_tokens([messages[i]])
+            if cum > target_tokens:
+                cut = i + 1
+                break
+            cut = i
+
+        # Step 2: expand cut to respect tool pairs
+        # 2a: if msg at cut is a tool_result, advance past the pair
+        while cut < n and _is_tool_result(messages[cut]):
+            cut += 1
+
+        # 2b: if msg at cut-1 (last deleted) is assistant with tool_use, pull back
+        while cut > head_keep and cut < n:
+            prev = messages[cut - 1]
+            if prev.get("role") == "assistant":
+                content = prev.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_use"
+                    for b in content
+                ):
+                    cut -= 1
+                    continue
+            break
+
+        if cut <= head_keep:
+            return messages  # don't delete everything
+
+        retained = messages[:head_keep] + messages[cut:]
+        deleted = n - len(retained)
+        logger.info(
+            "[tencentdb-offload] local_compact: deleted %d/%d msgs, kept %d, target=%d tokens",
+            deleted, n, len(retained), target_tokens,
+        )
+        return retained
+
     def _ingest_before_compact(
         self, messages: List[Dict[str, Any]], session_id: str
     ) -> None:
@@ -931,12 +1080,10 @@ class TencentDBOffloadEngine(ContextEngine):
         """Called before each LLM call (via pre_llm_call hook).
 
         Mirrors OpenClaw's ``before_prompt_build`` / ``llm_input_l3``:
-          1. Filter heartbeat messages
-          2. Request MMD injection data from Gateway
-          3. If approaching threshold, trigger incremental compression
-
-        Returns None (no message injection) — this hook modifies messages
-        in-place via the Gateway compact API rather than injecting context.
+          1. L1.5 trigger (fire-and-forget prompt + recent_messages to Gateway)
+          2. Filter heartbeat messages
+          3. Request MMD injection data from Gateway
+          4. If approaching threshold, trigger incremental compression
         """
         if not messages:
             return None
@@ -944,6 +1091,12 @@ class TencentDBOffloadEngine(ContextEngine):
         session_id = self._session_id or kwargs.get("session_id", "hermes-default")
         if session_id and session_id != self._session_id:
             self.bind_session(session_id)
+
+        # Step 0: L1.5 — send prompt + recent_messages to Gateway (fire-and-forget)
+        try:
+            self._trigger_l15_if_needed(messages, session_id)
+        except Exception as exc:
+            logger.debug("[tencentdb-offload] L1.5 error: %s", exc)
 
         # Step 1: Filter heartbeat messages (best-effort, in-place)
         self._filter_heartbeat_messages(messages)

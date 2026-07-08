@@ -163,7 +163,10 @@ def _make_post_tool_call_handler(engine):
                 except (TypeError, ValueError):
                     pass
 
-            engine.ingest_tool_pairs([pair])
+            engine.ingest_tool_pairs(
+                [pair],
+                prompt=engine._cached_prompt or None,
+            )
         except Exception as exc:
             logger.debug("[tencentdb-offload] post_tool_call hook error: %s", exc)
 
