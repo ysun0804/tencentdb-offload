@@ -11,8 +11,9 @@
 ### 核心压缩
 
 - **L1 卸载**：工具调用/结果对的摘要化（通过 Gateway L1 异步提取）
+- **L1.5 上下文提取**：每次新 prompt 触发，fire-and-forget 发送 prompt+recent_messages 到 Gateway（v0.5.0）
 - **L2 Mermaid 画布**：对话状态的可视化符号图谱（从 Gateway query-mmd 获取）
-- **L3 压缩**：4 级级联压缩（fast-path → mild → aggressive → emergency）
+- **L3 压缩**：4 级级联压缩（fastpath → mild → aggressive → emergency）
 - **自适应截断**：compact 前自动评估 HTTP body 大小，逐级截断 tool result
 - **Anthropic 格式支持**：识别 user 消息中的 tool_result content blocks
 
@@ -20,11 +21,15 @@
 
 | Hook | 时机 | 作用 |
 |------|------|------|
-| `post_tool_call` | 每次工具调用后 | 异步 ingest tool_pair 到 Gateway（L1 数据来源） |
-| `pre_llm_call` | 每次 LLM 调用前 | 心跳过滤 + MMD 画布注入 + 增量压缩 |
+| `post_tool_call` | 每次工具调用后 | 异步 ingest tool_pair 到 Gateway（含 cached_prompt 上下文） |
+| `pre_llm_call` | 每次 LLM 调用前 | 心跳过滤 + MMD 画布注入 + 增量压缩 + L1.5 触发 |
 
 ### 高级特性
 
+- **L1.5 提取**：每次新 prompt 触发，发送 prompt+recent_messages 到 Gateway，提升 L1 提取质量（v0.5.0）
+- **ingestWithContext**：tool_pair ingest 时附带对话上下文，Gateway 能看到完整语境（v0.5.0）
+- **isInternalPrompt**：过滤 Pre-compaction / Inter-session / HEARTBEAT 内部 prompt（v0.5.0）
+- **localCompact**：工具对感知的本地压缩，不拆分 tool_use/tool_result 对（v0.5.0）
 - **SessionRegistry**：多 session 状态管理，LRU 淘汰（默认 20 个）
 - **SessionState**：每 session 独立跟踪（processed/confirmed/deleted IDs）
 - **Reclaimer**：过期 session 数据清理（可配置保留天数）
@@ -46,14 +51,12 @@ Hermes Agent
   │           │
   │           ├── compress()         ──→  POST :8420/v2/offload/compact
   │           ├── ingest()           ──→  POST :8420/v2/offload/ingest（异步）
-  │           ├── should_compress()  →   阈值检查（0.4 × context_window）
-  │           ├── pre_llm_call()     →   心跳过滤 + MMD 注入 + 增量压缩
+  │           ├── should_compress()  →   阈值检查（threshold × context_window）
+  │           ├── pre_llm_call()     →   心跳过滤 + MMD 注入 + 增量压缩 + L1.5
+  │           ├── post_tool_call()   →   ingest tool_pair（含 cached_prompt）
   │           ├── reclaim()          →   过期 session 清理
   │           ├── __deepcopy__()     →   子 Agent fork 时复制预算状态
   │           └── _fallback_compress() →  本地尾部截断（Gateway 不可用时）
-  │
-  ├── post_tool_call hook
-  │     └── 每次工具调用后异步 ingest tool_pair（含 timestamp）
   │
   └── TencentDB Gateway :8420（Node.js，独立进程）
         ├── /v2/offload/compact    — 同步多级压缩
@@ -66,30 +69,130 @@ Hermes Agent
 
 | 官方功能 | 本插件实现 | 状态 |
 |---------|-----------|------|
-| `afterToolCall` hook | `post_tool_call` hook | ✅ |
-| `beforePromptBuild` hook | `pre_llm_call` hook | ✅ |
+| `afterToolCall` hook | `post_tool_call` hook（含 ingestWithContext） | ✅ |
+| `beforePromptBuild` hook | `pre_llm_call` hook（含 L1.5 触发） | ✅ |
 | `assemble()` — fastpath 重放 | `pre_llm_call` 中执行 | ✅ |
+| `triggerL15IfNeeded()` | `_trigger_l15_if_needed()` | ✅ |
+| `buildRecentMessages()` | `_build_recent_messages()` | ✅ |
+| `formatContextForL1()` | `_format_context_for_l1()` | ✅ |
+| `isInternalPrompt()` | `_is_internal_prompt()` | ✅ |
+| `localCompact()` — 工具对感知 | `_local_compact()` | ✅ |
 | L2 Mermaid 画布注入 | `_inject_mmd_from_gateway` | ✅ |
 | Reclaimer | `reclaim(retention_days)` | ✅ |
 | SessionRegistry | `SessionRegistry` 类 + LRU | ✅ |
 | SessionState | `SessionState` 类 | ✅ |
-| 4 级压缩（fastpath/mild/aggressive/emergency） | 委托 Gateway | ✅ |
-| `context_window` 对齐 | `tokens/0.7` 让 ratio 落在 mild 区间 | ✅ |
+| 4 级压缩（fastpath/mild/aggressive/emergency） | 委托 Gateway `resolveLevel()` | ✅ |
 | `ingest_before_compact` | compress() 时先 ingest 完整消息 | ✅ |
 
-## 配置
+## 压缩级别与阈值
 
-环境变量（在 `~/.hermes/.env` 中设置）：
+### 压缩流程
+
+```
+每轮 LLM 调用:
+  1. pre_llm_call → L1.5 触发（fire-and-forget）+ 心跳过滤 + MMD 注入
+  2. should_compress() → tokens >= threshold_tokens?
+     ├─ 否 → 跳过
+     └─ 是 → compress() → POST /v2/offload/compact
+           │
+           └─ Gateway resolveLevel(ratio):
+              ratio = totalTokens / contextWindow
+              ├─ ratio < mildRatio      → fastpath（替换已确认 L1 摘要）
+              ├─ mildRatio ≤ ratio < aggressiveRatio → mild（LLM 摘要替换 tool result）
+              ├─ aggressiveRatio ≤ ratio < emergencyRatio → aggressive（删旧消息）
+              └─ ratio ≥ emergencyRatio → emergency（只保留最近 N 条）
+```
+
+### 阈值配置
+
+**客户端阈值**（`~/.hermes/.env`）：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `TENCENTDB_OFFLOAD_THRESHOLD` | `0.25` | 触发 compact 的阈值（占 context_window 比例） |
+
+**服务端阈值**（`~/.memory-tencentdb/hermes-tdai/tdai-gateway.json` → `offload` 字段）：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `mildOffloadRatio` | `0.5` | mild 级别触发 ratio |
+| `aggressiveCompressRatio` | `0.85` | aggressive 级别触发 ratio |
+| `emergencyCompressRatio` | `0.95` | emergency 级别触发 ratio |
+
+### 阈值关系
+
+客户端阈值决定"什么时候调 compact"，服务端阈值决定"用什么级别压缩"。两者独立：
+
+- 客户端 `TENCENTDB_OFFLOAD_THRESHOLD=0.25` → 250K tokens 时开始调 compact
+- 但 Gateway 在 ratio < mildRatio 时只做 fastpath（几乎无开销）
+- 随着 context 增长，Gateway 自动升级压缩级别
+
+**官方默认值（推荐）：** mild=0.5, aggressive=0.85, emergency=0.95
+
+### 推荐配置：glm-5.2 保持 400K 上下文
+
+glm-5.2 在超过 ~400K tokens 后质量/速度开始下降。推荐配置：
+
+```json
+// ~/.memory-tencentdb/hermes-tdai/tdai-gateway.json
+{
+  "offload": {
+    "mildOffloadRatio": 0.35,
+    "aggressiveCompressRatio": 0.375,
+    "emergencyCompressRatio": 0.40
+  }
+}
+```
+
+```bash
+# ~/.hermes/.env
+TENCENTDB_OFFLOAD_THRESHOLD=0.25
+```
+
+效果（context_length=1M 自动探测）：
+
+| 实际 tokens | ratio | Gateway 级别 | 行为 |
+|---|---|---|---|
+| 250K | 0.25 | fastpath | 只替换已确认 L1 摘要（轻量） |
+| 350K | 0.35 | mild | 替换 tool result 为 LLM 摘要 |
+| 375K | 0.375 | aggressive | 删除旧消息（从头部开始） |
+| 400K | 0.40 | emergency | 只保留最近 N 条消息 |
+
+**关键：** 被删除的消息在 L0 JSONL 中有完整备份（`~/.memory-tencentdb/hermes-tdai/conversations/`），不会丢失。
+
+## 配置
+
+### 环境变量（`~/.hermes/.env`）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TENCENTDB_OFFLOAD_ENABLED` | `false` | 主开关 |
 | `TENCENTDB_OFFLOAD_GATEWAY_URL` | `http://127.0.0.1:8420` | Gateway 基础 URL |
 | `TENCENTDB_OFFLOAD_API_KEY` | `local` | Bearer 认证 token |
 | `TENCENTDB_OFFLOAD_INSTANCE_ID` | `default` | x-tdai-service-id 请求头 |
 | `TENCENTDB_OFFLOAD_COMPACT_RATIO` | `0.5` | 压缩后目标上下文比例 |
-| `TENCENTDB_OFFLOAD_THRESHOLD` | `0.75` | 触发压缩的阈值（占 context window 比例） |
+| `TENCENTDB_OFFLOAD_THRESHOLD` | `0.25` | 触发压缩的阈值（占 context_window 比例） |
 | `TENCENTDB_OFFLOAD_TIMEOUT_MS` | `90000` | compact 请求超时（毫秒） |
 | `TENCENTDB_OFFLOAD_INGEST_TIMEOUT_MS` | `5000` | ingest 请求超时（毫秒） |
+| `MEMORY_MAX_BODY_BYTES` | `10485760` | Gateway body 大小限制（10MB） |
+
+### Gateway 配置（`~/.memory-tencentdb/hermes-tdai/tdai-gateway.json`）
+
+```json
+{
+  "offload": {
+    "l1Model": "MiniMax-M3",
+    "l15Model": "MiniMax-M3",
+    "l2Model": "MiniMax-M3",
+    "mildOffloadRatio": 0.35,
+    "aggressiveCompressRatio": 0.375,
+    "emergencyCompressRatio": 0.40
+  }
+}
+```
+
+- `l1Model/l15Model/l2Model`：Gateway LLM 模型（用于 L1 提取、L1.5 上下文、L2 MMD 生成）
+- `mildOffloadRatio/aggressiveCompressRatio/emergencyCompressRatio`：压缩级别阈值
 
 ## 从 LCM 切换
 
@@ -106,48 +209,45 @@ Hermes Agent
 
 2. 在 `~/.hermes/.env` 中设置阈值：
    ```
-   TENCENTDB_OFFLOAD_THRESHOLD=0.4
+   TENCENTDB_OFFLOAD_THRESHOLD=0.25
    ```
 
 3. 重启 gateway：`hermes gateway restart`
 
 4. 验证日志：
    ```
-   [tencentdb-offload] model=glm-5.2, context_length=1000000, threshold=400000
+   [tencentdb-offload] model=glm-5.2, context_length=1000000, threshold=250000
    [tencentdb-offload] post_tool_call hook registered
    [tencentdb-offload] pre_llm_call hook registered
    ```
 
-## Gateway 配置
+## L0 对话历史备份
 
-### offload LLM 模型
+Gateway 的 L0 recorder 自动保存完整对话历史到 JSONL 文件：
 
-在 `~/.memory-tencentdb/hermes-tdai/tdai-gateway.json` 中添加 offload LLM 配置：
+```
+~/.memory-tencentdb/hermes-tdai/conversations/
+├── 2026-07-04.jsonl
+├── 2026-07-05.jsonl
+├── 2026-07-06.jsonl
+├── 2026-07-07.jsonl
+└── 2026-07-08.jsonl
+```
 
+每条记录格式：
 ```json
 {
-  "offload": {
-    "l1Model": "MiniMax-M3",
-    "l15Model": "MiniMax-M3",
-    "l2Model": "MiniMax-M3"
-  }
+  "sessionKey": "20260706_225227_a1374d",
+  "sessionId": "",
+  "recordedAt": "2026-07-06T19:35:25Z",
+  "id": "msg_xxx",
+  "role": "user",
+  "content": "...",
+  "timestamp": 1780601725431
 }
 ```
 
-不配置此字段时，Gateway 的 L1 提取不会执行（ingest 返回 200 但不生成 entries.jsonl），L2 MMD 画布也不会生成。
-
-### body 大小限制
-
-Gateway 默认 body 限制 **1MB**，compact payload 通常 2-3MB 会被直接断连（Broken pipe / Connection reset）。
-
-在 launchctl plist 的 `EnvironmentVariables` 中设置：
-
-```xml
-<key>MEMORY_MAX_BODY_BYTES</key>
-<string>10485760</string>
-```
-
-或启动脚本中 `MEMORY_MAX_BODY_BYTES=10485760`（10MB）。
+aggressive/emergency 压缩删除的对话消息在 L0 JSONL 中有完整备份，不会丢失。
 
 ## 降级行为
 
@@ -193,10 +293,20 @@ tencentdb-offload/
 2. **进程级 health cache** — `_available` 变量缓存健康检查结果，`bind_session()` 重置缓存让新 session 自动恢复
 3. **compress() 无锁 HTTP** — 持锁快照 mutable state，释放锁后做 HTTP 调用，避免 30s compact 阻塞并发写入
 4. **pre_llm_call 替代 assemble()** — Hermes ContextEngine ABC 不含 assemble()，用 pre_llm_call hook 等效实现
-5. **context_window 动态计算** — 传 `tokens/0.7` 让 Gateway ratio 落在 mild 区间（0.5-0.85），触发完整压缩级联
-6. **`__deepcopy__` 预算继承** — v0.18.0 subagent fork 时 `copy.deepcopy(engine)` 会因 `threading.Lock` 失败，自定义 `__deepcopy__` 只复制预算状态（`compression_count`/`last_prompt_tokens` 等），lock 和 session 状态重建
+5. **`__deepcopy__` 预算继承** — v0.18.0 subagent fork 时 `copy.deepcopy(engine)` 会因 `threading.Lock` 失败，自定义 `__deepcopy__` 只复制预算状态（`compression_count`/`last_prompt_tokens` 等），lock 和 session 状态重建
+6. **L1.5 fire-and-forget** — 用 daemon 线程发送，不阻塞主流程；prompt hash 去重避免同一 prompt 重复触发
+7. **ingestWithContext** — post_tool_call hook 传递 cached_prompt 给 ingest，Gateway 能看到对话上下文
 
 ## CHANGELOG
+
+### v0.5.0 (2026-07-08)
+- **L1.5 提取**：`_trigger_l15_if_needed()` — 每次新 prompt 触发，fire-and-forget 发送 prompt+recent_messages 到 Gateway，提升 L1 提取质量
+- **ingestWithContext**：`ingest_tool_pairs()` 接受 `prompt` 和 `recent_messages` 参数，post_tool_call hook 传递 cached_prompt
+- **buildRecentMessages**：`_build_recent_messages()` — 从消息列表提取最近 N 条 user/assistant 消息
+- **formatContextForL1**：`_format_context_for_l1()` — 格式化 prompt+recent 为 L1 上下文字符串
+- **isInternalPrompt**：`_is_internal_prompt()` — 过滤 Pre-compaction / Inter-session / HEARTBEAT
+- **localCompact**：`_local_compact()` — 工具对感知的本地压缩，不拆分 tool_use/tool_result 对
+- **`__deepcopy__` 更新**：复制 L1.5 状态（cached_prompt, cached_recent_messages, last_l15_hash）
 
 ### v0.4.2 (2026-07-08)
 - **修复 compact Broken pipe**：Gateway 默认 body 限制 1MB，实际 payload 2.3MB 被直接断连。根因是 `MEMORY_MAX_BODY_BYTES` 环境变量未设置，fallback 到 1MB 默认值。修复：Gateway plist 加 `MEMORY_MAX_BODY_BYTES=10485760`（10MB）
