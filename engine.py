@@ -1005,7 +1005,7 @@ class TencentDBOffloadEngine(ContextEngine):
             row = conn.execute(
                 "SELECT content FROM messages WHERE role='user' "
                 "AND content IS NOT NULL AND content != '' "
-                "ORDER BY id DESC LIMIT 1"
+                "ORDER BY timestamp DESC LIMIT 1"
             ).fetchone()
             conn.close()
             if row and row[0]:
