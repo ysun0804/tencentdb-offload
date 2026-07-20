@@ -112,7 +112,7 @@ def _make_post_tool_call_handler(engine):
     """
 
     def _handler(*args, **kwargs):
-        logger.info('[tencentdb-offload] post_tool_call FIRED: tool=%s', kwargs.get("tool_name", "?"))
+        logger.info('[tencentdb-offload] post_tool_call FIRED: tool=%s, kwargs_keys=%s', kwargs.get("tool_name", "?"), sorted(kwargs.keys()))
         try:
             tool_name = kwargs.get("tool_name") or ""
             tool_call_id = (
@@ -167,6 +167,17 @@ def _make_post_tool_call_handler(engine):
                 [pair],
                 prompt=engine._cached_prompt or None,
             )
+
+            # ── L1.5 trigger (fallback for Hermes pre_llm_call gap) ──
+            # Hermes v0.18.0 never fires pre_llm_call, so we trigger L1.5
+            # here in post_tool_call instead.  Uses cached prompt/recent
+            # from the last user message (set by pre_llm_call if it fires,
+            # or by our own _extract_last_user_prompt fallback).
+            try:
+                sid = engine._session_id or str(session_id or "hermes-default")
+                engine._trigger_l15_from_cache(sid)
+            except Exception as exc2:
+                logger.debug("[tencentdb-offload] L1.5 fallback trigger error: %s", exc2)
         except Exception as exc:
             logger.debug("[tencentdb-offload] post_tool_call hook error: %s", exc)
 

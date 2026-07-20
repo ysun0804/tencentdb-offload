@@ -938,6 +938,58 @@ class TencentDBOffloadEngine(ContextEngine):
 
         threading.Thread(target=_fire, daemon=True).start()
 
+    def _trigger_l15_from_cache(self, session_id: str) -> None:
+        """L1.5 fallback: trigger from post_tool_call using cached prompt.
+
+        Hermes v0.18.0 never fires pre_llm_call, so we use this method
+        in post_tool_call to send L1.5 to Gateway with the cached prompt
+        and recent messages.  Dedup is via _last_l15_hash (same as
+        _trigger_l15_if_needed).
+        """
+        prompt = self._cached_prompt
+        if not prompt or self._is_internal_prompt(prompt):
+            return
+
+        import hashlib
+        h = hashlib.md5(prompt.encode()).hexdigest()[:16]
+        if h == self._last_l15_hash:
+            return
+        self._last_l15_hash = h
+
+        if not self._check_available():
+            return
+
+        recent = self._cached_recent_messages or []
+        logger.info(
+            "[tencentdb-offload] L1.5 (post_tool_call fallback) firing: hash=%s, session=%s, prompt=%s",
+            h, session_id, prompt[:80],
+        )
+
+        def _fire():
+            try:
+                resp = _post_json(
+                    f"{self._gateway_url}/v2/offload/ingest",
+                    {
+                        "session_id": session_id,
+                        "tool_pairs": [],
+                        "prompt": prompt[:500],
+                        "recent_messages": [
+                            {"role": m["role"], "content": m["content"][:300]}
+                            for m in recent[-5:]
+                        ] if recent else [],
+                    },
+                    self._headers,
+                    self._ingest_timeout_ms,
+                )
+                logger.info(
+                    "[tencentdb-offload] L1.5 (fallback) sent OK: hash=%s, resp=%s",
+                    h, str(resp)[:200] if resp else "(empty)",
+                )
+            except Exception as exc:
+                logger.warning("[tencentdb-offload] L1.5 (fallback) failed: %s", exc)
+
+        threading.Thread(target=_fire, daemon=True).start()
+
     def _local_compact(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
