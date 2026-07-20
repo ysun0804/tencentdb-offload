@@ -939,16 +939,19 @@ class TencentDBOffloadEngine(ContextEngine):
         threading.Thread(target=_fire, daemon=True).start()
 
     def _trigger_l15_from_cache(self, session_id: str) -> None:
-        """L1.5 fallback: trigger from post_tool_call using cached prompt.
+        """L1.5 fallback: trigger from post_tool_call.
 
         Hermes v0.18.0 never fires pre_llm_call, so we use this method
-        in post_tool_call to send L1.5 to Gateway with the cached prompt
-        and recent messages.  Dedup is via _last_l15_hash (same as
-        _trigger_l15_if_needed).
+        in post_tool_call to send L1.5 to Gateway.  Reads the latest
+        user prompt from Hermes state.db.
         """
-        prompt = self._cached_prompt
+        # Read latest user message from Hermes state.db
+        prompt = self._read_latest_user_prompt()
         if not prompt or self._is_internal_prompt(prompt):
             return
+
+        # Also cache for ingestWithContext
+        self._cached_prompt = prompt[:500]
 
         import hashlib
         h = hashlib.md5(prompt.encode()).hexdigest()[:16]
@@ -961,7 +964,7 @@ class TencentDBOffloadEngine(ContextEngine):
 
         recent = self._cached_recent_messages or []
         logger.info(
-            "[tencentdb-offload] L1.5 (post_tool_call fallback) firing: hash=%s, session=%s, prompt=%s",
+            "[tencentdb-offload] L1.5 (post_tool_call) firing: hash=%s, session=%s, prompt=%s",
             h, session_id, prompt[:80],
         )
 
@@ -982,13 +985,34 @@ class TencentDBOffloadEngine(ContextEngine):
                     self._ingest_timeout_ms,
                 )
                 logger.info(
-                    "[tencentdb-offload] L1.5 (fallback) sent OK: hash=%s, resp=%s",
+                    "[tencentdb-offload] L1.5 (post_tool_call) sent OK: hash=%s, resp=%s",
                     h, str(resp)[:200] if resp else "(empty)",
                 )
             except Exception as exc:
-                logger.warning("[tencentdb-offload] L1.5 (fallback) failed: %s", exc)
+                logger.warning("[tencentdb-offload] L1.5 (post_tool_call) failed: %s", exc)
 
         threading.Thread(target=_fire, daemon=True).start()
+
+    def _read_latest_user_prompt(self) -> Optional[str]:
+        """Read latest user message from Hermes state.db."""
+        try:
+            import sqlite3
+            import os
+            db_path = os.path.expanduser("~/.hermes/state.db")
+            if not os.path.exists(db_path):
+                return None
+            conn = sqlite3.connect(db_path, timeout=2)
+            row = conn.execute(
+                "SELECT content FROM messages WHERE role='user' "
+                "AND content IS NOT NULL AND content != '' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row and row[0]:
+                return str(row[0])[:500]
+        except Exception as exc:
+            logger.debug("[tencentdb-offload] _read_latest_user_prompt error: %s", exc)
+        return None
 
     def _local_compact(
         self, messages: List[Dict[str, Any]]
