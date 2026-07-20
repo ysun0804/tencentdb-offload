@@ -883,7 +883,11 @@ class TencentDBOffloadEngine(ContextEngine):
         prompt so Gateway has real-time context for L1 extraction.
         """
         prompt = _extract_last_user_prompt(messages)
-        if not prompt or self._is_internal_prompt(prompt):
+        if not prompt:
+            logger.info("[tencentdb-offload] L1.5 skip: no prompt extracted")
+            return
+        if self._is_internal_prompt(prompt):
+            logger.info("[tencentdb-offload] L1.5 skip: internal prompt")
             return
 
         # Update cache for ingestWithContext
@@ -895,16 +899,23 @@ class TencentDBOffloadEngine(ContextEngine):
         import hashlib
         h = hashlib.md5(prompt.encode()).hexdigest()[:16]
         if h == self._last_l15_hash:
+            logger.info("[tencentdb-offload] L1.5 skip: dup hash=%s", h)
             return
         self._last_l15_hash = h
 
         if not self._check_available():
+            logger.info("[tencentdb-offload] L1.5 skip: gateway not available")
             return
+
+        logger.info(
+            "[tencentdb-offload] L1.5 firing: hash=%s, session=%s, prompt=%s, recent=%d",
+            h, session_id, prompt[:80], len(recent),
+        )
 
         # Fire-and-forget in daemon thread
         def _fire():
             try:
-                _post_json(
+                resp = _post_json(
                     f"{self._gateway_url}/v2/offload/ingest",
                     {
                         "session_id": session_id,
@@ -918,12 +929,12 @@ class TencentDBOffloadEngine(ContextEngine):
                     self._headers,
                     self._ingest_timeout_ms,
                 )
-                logger.debug(
-                    "[tencentdb-offload] L1.5 sent: hash=%s, recent_msgs=%d",
-                    h, len(recent),
+                logger.info(
+                    "[tencentdb-offload] L1.5 sent OK: hash=%s, resp=%s",
+                    h, str(resp)[:200] if resp else "(empty)",
                 )
             except Exception as exc:
-                logger.debug("[tencentdb-offload] L1.5 failed: %s", exc)
+                logger.warning("[tencentdb-offload] L1.5 failed: %s", exc)
 
         threading.Thread(target=_fire, daemon=True).start()
 
